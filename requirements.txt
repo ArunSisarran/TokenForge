@@ -1,0 +1,9 @@
+# Phase 0 baseline dependencies.
+# Pinned with lower bounds only for now; in Phase 4 (Docker) we pin exact
+# versions so every build is reproducible.
+torch>=2.4
+transformers>=4.51   # 4.51+ is needed for Qwen3 models
+accelerate>=0.33     # faster, lower-memory weight loading
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
