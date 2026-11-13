@@ -15,6 +15,7 @@ import os
 import threading
 import time
 import uuid
+from typing import Any
 import torch
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
@@ -34,7 +35,8 @@ DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
 print(f"Loading {MODEL_ID} on {DEVICE} ({DTYPE})...")
 _t0 = time.time()
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=DTYPE).to(DEVICE)
+# device_map loads the weights straight onto DEVICE (needs accelerate)
+model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=DTYPE, device_map=DEVICE)
 model.eval()  # switches off training-only behavior such as dropout
 print(f"Loaded in {time.time() - _t0:.1f}s")
 
@@ -55,6 +57,8 @@ class ChatRequest(BaseModel):
     max_tokens: int = 256
     temperature: float = 0.7
     stream: bool = False
+    ignore_eos: bool = False
+    stream_options: dict | None = None
 
 
 app = FastAPI(title="TokenForge baseline")
@@ -85,7 +89,9 @@ def build_inputs(messages: list[Message]):
 
 
 def generation_kwargs(req: ChatRequest, inputs) -> dict:
-    kwargs = dict(**inputs, max_new_tokens=req.max_tokens, pad_token_id=PAD_ID)
+    kwargs: dict[str, Any] = dict(**inputs, max_new_tokens=req.max_tokens, pad_token_id=PAD_ID)
+    if req.ignore_eos:
+        kwargs["min_new_tokens"] = req.max_tokens
     if req.temperature > 0:
         kwargs.update(do_sample=True, temperature=req.temperature)
     else:
@@ -100,7 +106,7 @@ def chat_completions(req: ChatRequest):
 
     if req.stream:
         return StreamingResponse(
-            stream_tokens(req, inputs), media_type="text/event-stream"
+            stream_tokens(req, inputs, prompt_tokens), media_type="text/event-stream"
         )
 
     with GPU_LOCK:
@@ -150,10 +156,11 @@ def chat_completions(req: ChatRequest):
 # generate() blocks until it finishes, so we run it in a background thread.
 # TextIteratorStreamer is a queue: generate() pushes decoded text into it,
 # and this function pulls text out and sends it to the client.
-def stream_tokens(req: ChatRequest, inputs):
+def stream_tokens(req: ChatRequest, inputs, prompt_tokens: int):
     streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
     request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
+    result = {"completion_tokens": 0}  # filled in by the generate thread
 
     def chunk(delta: dict, finish_reason=None) -> str:
         payload = {
@@ -169,7 +176,8 @@ def stream_tokens(req: ChatRequest, inputs):
         def run_generate():
             # inference_mode is per-thread, so it must be set inside the thread.
             with torch.inference_mode():
-                model.generate(**generation_kwargs(req, inputs), streamer=streamer)
+                output = model.generate(**generation_kwargs(req, inputs), streamer=streamer)
+            result["completion_tokens"] = output.shape[1] - prompt_tokens
 
         worker = threading.Thread(target=run_generate)
         worker.start()
@@ -184,5 +192,21 @@ def stream_tokens(req: ChatRequest, inputs):
             # request and free its memory — another thing vLLM does for us.)
             worker.join()
 
-    yield chunk({}, finish_reason="stop")
+    n = result["completion_tokens"]
+    yield chunk({}, finish_reason="length" if n >= req.max_tokens else "stop")
+
+    if req.stream_options and req.stream_options.get("include_usage"):
+        usage_payload = {
+            "id": request_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": MODEL_ID,
+            "choices": [],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": n,
+                "total_tokens": prompt_tokens + n,
+            },
+        }
+        yield f"data: {json.dumps(usage_payload)}\n\n"
     yield "data: [DONE]\n\n"
