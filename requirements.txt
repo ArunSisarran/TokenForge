@@ -7,3 +7,5 @@ accelerate>=0.33     # faster, lower-memory weight loading
 fastapi>=0.110
 uvicorn[standard]>=0.29
 pydantic>=2.6
+httpx>=0.27        # async HTTP client with streaming support
+matplotlib>=3.8    # plots
