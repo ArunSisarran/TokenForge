@@ -5,7 +5,7 @@ from a deliberately naive baseline to an optimized, autoscaled Kubernetes
 deployment. Every layer is benchmarked against the one before it, so each
 optimization comes with a measured before/after number.
 
-**Model:** Qwen3-8B  **Hardware:** NVIDIA L4 (24 GB)  **Status:** Phase 0 of 7 complete
+**Model:** Qwen3-8B  **Hardware:** NVIDIA L4 (24 GB)  **Status:** Phase 0 complete, Phase 1 in progress
 
 ---
 
@@ -43,11 +43,12 @@ concurrency 1, 4 and 16. Extra users only waited in line.
 average. At concurrency 4 a request waits behind ~3 others, so predicted TTFT
 ≈ 31.5 s; measured p50 was 31.3 s. At concurrency 16, p95 TTFT reached 173 s.
 
-**3. Decode is memory-bandwidth-bound.** Generating each token reads all
-~16.4 GB of weights. At the L4's ~300 GB/s, the ceiling is ~18 tok/s (55 ms per
-token). Measured TPOT was 65.6 ms, an effective ~250 GB/s, about 83% of the
-hardware limit. Per-token speed is fine; serving one request at a time is the
-problem.
+**3. Decode is memory-bandwidth-bound.** Generating each token reads every
+transformer-block weight plus the `lm_head`, about 15.2 GB (the 1.2 GB
+embedding table is a single-row lookup, not a full read). At the L4's
+~300 GB/s, the ceiling is ~51 ms per token. Measured TPOT was 65.6 ms, about
+77% of the hardware limit. Per-token speed is decent; serving one request at
+a time is the problem.
 
 **4. Prefill is ~200x cheaper per token than decode.** TTFT at concurrency 1
 grew as ~150 ms + 0.3 ms per prompt token, about 3,500 prompt tokens/s,
@@ -66,10 +67,84 @@ Full write-up: [docs/phase-0-baseline.md](docs/phase-0-baseline.md)
 
 ---
 
+## Phase 1 findings (in progress): profiling one request
+
+Before optimizing, `optimize/model_math.py` predicts memory use and decode
+ceilings from the model config, and `optimize/profile_request.py` runs
+prefill and decode by hand under the PyTorch profiler to see where GPU time
+actually goes.
+
+**Model math predictions (Qwen3-8B on L4, 512-token context):**
+
+| Weights | Weight memory | KV cache room | Min time per token | Max tok/s |
+| --- | --- | --- | --- | --- |
+| FP16 | 16.4 GB | ~36k tokens | 50.7 ms | ~20 |
+| FP8 | 9.4 GB | ~84k tokens | 27.6 ms | ~36 |
+| INT4 | 6.0 GB | ~107k tokens | 16.0 ms | ~63 |
+
+KV cache: 144 KB per token (36 layers × 8 KV heads × 128 dims × K and V × 2 bytes).
+Grouped-query attention (8 KV heads for 32 query heads) makes it 4x smaller.
+
+**Where one decode step's time goes** (HF FP16, from the profiler trace):
+
+| | 512-token prompt | 2048-token prompt |
+| --- | --- | --- |
+| Total step time | 67.5 ms | 68.3 ms |
+| Matrix multiplications | 58.8 ms (87%) | 59.0 ms (86%) |
+| Other small kernels | 4.6 ms (7%) | 6.3 ms (9%) |
+| GPU idle (gaps) | 3.4 ms (5%) | 3.0 ms (4%) |
+| Kernels launched per step | 2,074 | 2,074 |
+| Model-math ceiling | 50.7 ms | 55.0 ms |
+
+**1. Kernel launch gaps are small.** I expected idle time between the ~2,000
+kernels per step to explain most of the gap to the ceiling. The trace showed
+only ~5%: each matmul runs ~230 µs, long enough for Python to queue the next
+kernels, so the GPU rarely waits. CUDA graphs can recover at most that 5% here.
+
+**2. The matmul kernels themselves run near the practical limit.** They read
+~15.1 GB in 58.8 ms, about 257 GB/s or 86% of the L4's 300 GB/s spec. Real
+kernels rarely exceed 85–90% of spec bandwidth.
+
+**3. Kernel timing confirms decode is memory-bound.** Decode runs 253 `gemv`
+(matrix × vector) kernels per step: 7 per layer (Q, K, V, O, gate, up, down)
+× 36 layers + 1 for the `lm_head`. Their time splits 79% / 21% between the
+MLP + `lm_head` and the attention projections; their bytes split 80% / 20%.
+Time tracks bytes.
+
+**4. Hugging Face copies the whole KV cache every step.** Each step runs 72
+`torch.cat` copy kernels (2 per layer) that rebuild the cache to append one
+token. Their share doubled from 2.2% to 4.1% of the step between 512 and 2048
+tokens of context, and the total cost grows quadratically with generation
+length. This is the problem vLLM's PagedAttention avoids by preallocating
+cache blocks and writing in place.
+
+**5. Prefill is compute-bound but uses about a third of peak.** The GPU was
+97–99% busy. 512 tokens took 180 ms (~40 TFLOPS) and 2048 tokens 659 ms
+(~43 TFLOPS), against roughly 120 TFLOPS FP16 peak. Unfused elementwise ops
+(such as RMSNorm's separate squaring step) took 9% of prefill at 512 tokens
+and 17% at 2048, which kernel fusion in engines like vLLM removes. Attention
+itself was under 2% of decode time at these context lengths.
+
+**What this means for the rest of Phase 1:** at one request at a time, the HF
+baseline is already near the practical bandwidth limit, so a better engine
+alone should give only a modest per-token gain. The large levers are reading
+fewer bytes (quantization, next) and serving many requests per read of the
+weights (batching, Phase 2).
+
+Full write-up (in progress): [docs/phase-1-optimization.md](docs/phase-1-optimization.md)
+
+---
+
 ## Roadmap
 
 - [x] **Phase 0: Baseline.** Naive HF server and benchmark harness
-- [ ] **Phase 1: Model optimization.** Profiling, FP8 and INT4 quantization, quality evals, speculative decoding
+- [ ] **Phase 1: Model optimization.**
+    - [x] Model math: memory, KV cache, and decode ceilings per precision
+    - [x] Profiling: prefill vs decode, kernel breakdown
+    - [ ] FP8 and INT4 quantization
+    - [ ] Quality evals (perplexity, task accuracy)
+    - [ ] Speed benchmarks: FP16 vs FP8 vs INT4
+    - [ ] FP8 KV cache and speculative decoding
 - [ ] **Phase 2: Inference engine.** vLLM tuning (continuous batching, prefix caching, chunked prefill), comparison with SGLang
 - [ ] **Phase 3: Gateway.** API keys, per-key rate limiting (Redis), streaming proxy
 - [ ] **Phase 4: Containers.** Multi-stage Docker images, docker-compose stack
@@ -91,9 +166,11 @@ TokenForge/
 │   ├── plot.py             # latency vs throughput chart
 │   ├── workloads/          # committed once, never edited
 │   └── results/            # one JSON per run, with full metadata
+├── optimize/
+│   ├── model_math.py       # predicts memory, KV cache size, decode ceilings
+│   └── profile_request.py  # profiles prefill and decode, exports a GPU trace
 ├── docs/                   # one write-up per phase
-├── requirements-baseline.txt
-└── requirements-bench.txt
+└── requirements.txt        # all Python dependencies
 ```
 
 ---
@@ -103,8 +180,8 @@ TokenForge/
 ```bash
 git clone https://github.com/YOUR-USERNAME/TokenForge.git
 cd TokenForge
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements-baseline.txt -r requirements-bench.txt
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
 ```
 
 **Run the baseline server.** Use a small model on a laptop, or Qwen3-8B on a 24 GB GPU:
