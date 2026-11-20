@@ -17,7 +17,9 @@ harness, and the same GPU, so rows are directly comparable.
 | Phase | Configuration | Out tok/s @ c=16 | TTFT p95 @ c=16 | TPOT p50 @ c=1 | $ / 1M output tokens |
 | --- | --- | --- | --- | --- | --- |
 | 0 | Hugging Face `transformers`, FP16, one request at a time | 14.9 | 172,658 ms | 65.6 ms | $13.01 |
-| 1 | Quantization (FP8 / INT4) | | | | |
+| 1 | vLLM, FP16, one request at a time | 16.5 | 163,507 ms | 59.9 ms | $11.77 |
+| 1 | vLLM, FP8 weights (W8A8), one request at a time | 26.3 | 102,331 ms | 37.6 ms | $7.39 |
+| 1 | vLLM, INT4 weights (GPTQ W4A16), one request at a time | 46.7 | 60,404 ms | 20.8 ms | $4.17 |
 | 2 | vLLM: continuous batching, prefix caching | | | | |
 | 6 | Kubernetes, cache-aware routing, autoscaling | | | | |
 
@@ -67,7 +69,7 @@ Full write-up: [docs/phase-0-baseline.md](docs/phase-0-baseline.md)
 
 ---
 
-## Phase 1 findings (in progress): profiling one request
+## Phase 1 findings (in progress)
 
 Before optimizing, `optimize/model_math.py` predicts memory use and decode
 ceilings from the model config, and `optimize/profile_request.py` runs
@@ -109,8 +111,24 @@ Grouped-query attention (8 KV heads for 32 query heads) makes it 4x smaller.
 **What this means for the rest of Phase 1:** at one request at a time, the HF
 baseline is already near the practical bandwidth limit, so a better engine
 alone should give only a modest per-token gain. The large levers are reading
-fewer bytes (quantization, next) and serving many requests per read of the
+fewer bytes (quantization) and serving many requests per read of the
 weights (batching, Phase 2).
+
+**Speed and quality per precision** (vLLM 0.34, one request at a time, chat workload):
+
+| | TPOT p50 | Speed-up vs HF | $ / 1M tokens | GSM8K (5-shot) | KV cache room |
+| --- | --- | --- | --- | --- | --- |
+| FP16 | 59.9 ms | 1.1x | $11.77 | 87.64 | 10,240 tokens |
+| FP8 | 37.6 ms | 1.7x | $7.39 | 86.73 | 56,320 tokens |
+| INT4 | 20.8 ms | 3.2x | $4.17 | 85.75 | 79,360 tokens |
+
+**6. The engine alone gave +10.6% throughput** (TPOT 65.6 → 59.9 ms), inside my 10–15% prediction: vLLM's whole step now takes about as long as HF's matmuls alone.
+
+**7. Quantization sped up decode almost in proportion to bytes:** INT4 reads 3.2x fewer bytes than FP16 and ran 2.9x faster; FP8 reads 1.8x fewer and ran 1.6x faster.
+
+**8. I was wrong that INT4 wouldn't help prefill:** the chat prompts (~295 tokens) are below the L4's ~400-token compute-bound point, so TTFT p50 fell 110 → 80 ms for INT4 (and 69 ms for FP8, which also gets 2x tensor-core FLOPs).
+
+**9. Cost fell 3.1x for 1.9 GSM8K points** ($13.01 → $4.17 per 1M tokens with INT4). Goodput at concurrency 16 is still 1 in 32, so batching (Phase 2) is the next big lever.
 
 Full write-up (in progress): [docs/phase-1-optimization.md](docs/phase-1-optimization.md)
 
@@ -124,7 +142,7 @@ Full write-up (in progress): [docs/phase-1-optimization.md](docs/phase-1-optimiz
     - [x] Profiling: prefill vs decode, kernel breakdown
     - [x] FP8 and INT4 quantization
     - [x] Quality evals (perplexity, task accuracy)
-    - [ ] Speed benchmarks: FP16 vs FP8 vs INT4
+    - [x] Speed benchmarks: FP16 vs FP8 vs INT4
     - [ ] FP8 KV cache and speculative decoding
 - [ ] **Phase 2: Inference engine.** vLLM tuning (continuous batching, prefix caching, chunked prefill), comparison with SGLang
 - [ ] **Phase 3: Gateway.** API keys, per-key rate limiting (Redis), streaming proxy
@@ -223,6 +241,8 @@ requests (shuffled with a fixed seed) after 2 warmup requests.
 Latencies are reported as percentiles (p50, p95, p99), not averages.
 
 **Environment for reported results.** NVIDIA L4 (23 GB usable), driver
-595.91.07, RunPod at $0.70/hour, Python 3.12, server and load generator on
-the same machine (no network latency included). Every result file in
+595.91.07 (Phase 0) and 595.112.07 (Phase 1), RunPod at $0.70/hour, Python
+3.12, server and load generator on the same machine (no network latency
+included). vLLM runs use vLLM 0.34.0 with prefix caching off and Qwen3's
+thinking mode off, to match the baseline. Every result file in
 `bench/results/` records its full configuration, git commit and hardware.

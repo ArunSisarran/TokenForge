@@ -12,8 +12,8 @@ one variable at a time.
 | 2. Profiling: where prefill and decode time goes | ✅ done |
 | 3. FP8 and INT4 quantization | ✅ done |
 | 4. Quality evals (perplexity, task accuracy) | ✅ done |
-| 5. Speed benchmarks: FP16 vs FP8 vs INT4 in vLLM | ⬜ next |
-| 6. FP8 KV cache and speculative decoding | ⬜ |
+| 5. Speed benchmarks: FP16 vs FP8 vs INT4 in vLLM | ✅ done |
+| 6. FP8 KV cache and speculative decoding | ⬜ next |
 
 ---
 
@@ -312,4 +312,112 @@ start-up), but BF16's tiny KV cache limits how many sequences vLLM can batch.
 INT4 was no faster than FP8 despite more KV room and fewer bytes: evals are
 mostly prefill, which is compute-bound, and FP8 runs on FP8 tensor cores
 while W4A16 still does FP16 math. Piece 5 measures this properly.
+
+---
+
+## Piece 5: Speed benchmarks in vLLM
+
+Two comparisons, one variable each:
+
+| Comparison | What changes | What it isolates |
+| --- | --- | --- |
+| HF FP16 (Phase 0) → vLLM FP16 | the engine | fused kernels, CUDA graphs, paged KV cache |
+| vLLM FP16 → vLLM FP8 / INT4 | the weights | the effect of reading fewer bytes per token |
+
+All three runs use `--max-num-seqs 1`, so vLLM serves one request at a time
+like the baseline; batching is Phase 2. Prefix caching is off, because every
+concurrency level sends the same 32 requests and cache hits would make TTFT
+look better than it is. Thinking is off, matching the baseline's chat
+template. The FP16 run uses `--dtype float16` to match the baseline exactly.
+
+```bash
+vllm serve $MODEL --dtype {float16|auto} --max-num-seqs 1 --max-model-len 4096 \
+  --gpu-memory-utilization 0.85 --no-enable-prefix-caching \
+  --default-chat-template-kwargs '{"enable_thinking": false}'
+python bench/loadgen.py --workload bench/workloads/chat.jsonl --model $MODEL \
+  --concurrency 1 4 16 --num-requests 32 --ignore-eos --max-tokens-cap 256 \
+  --gpu-cost-per-hour 0.70 --label vllm-{fp16,fp8,int4}-seq1-l4
+```
+
+Environment: as in piece 4 (vLLM 0.34.0, driver 595.112.07). Results are in
+`bench/results/vllm-*-seq1-l4-chat-*.json`.
+
+### Results (concurrency 1)
+
+| | Out tok/s | TPOT p50 | Model-math ceiling | % of ceiling | Effective GB/s | TTFT p50 | TTFT p95 | $ / 1M tokens |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| HF FP16 (Phase 0) | 14.95 | 65.6 ms | 50.7 ms | 77% | 232 | 225 ms | 419 ms | $13.01 |
+| vLLM FP16 | 16.53 | 59.9 ms | 50.7 ms | 85% | 254 | 110 ms | 234 ms | $11.77 |
+| vLLM FP8 | 26.31 | 37.6 ms | 27.6 ms | 73% | 221 | 69 ms | 153 ms | $7.39 |
+| vLLM INT4 | 46.64 | 20.8 ms | 16.0 ms | 77% | 231 | 80 ms | 214 ms | $4.17 |
+
+Effective GB/s = model-math bytes per token (512-token context) ÷ TPOT.
+Throughput and TPOT were the same at concurrency 4 and 16 (within 0.1%), as
+expected with one sequence at a time; only TTFT grew, from queueing.
+
+### Speed and quality together
+
+| | TPOT p50 | Speed-up vs HF | $ / 1M tokens | GSM8K strict | KV cache room |
+| --- | --- | --- | --- | --- | --- |
+| FP16 / BF16 | 59.9 ms | 1.1x | $11.77 | 87.64 | 10,240 tokens |
+| FP8 | 37.6 ms | 1.7x | $7.39 | 86.73 | 56,320 tokens |
+| INT4 | 20.8 ms | 3.2x | $4.17 | 85.75 | 79,360 tokens |
+
+Quality and KV room are from piece 4, where the reference model ran in BF16.
+FP16 and BF16 move the same bytes, so the speed is the same.
+
+### Findings
+
+**1. The engine alone gave 10.6% more throughput, inside my 10–15%
+prediction.** TPOT fell from 65.6 to 59.9 ms. vLLM's whole decode step is
+now about as long as just the matmuls were in the HF trace (58.8 ms in piece
+2). That fits vLLM removing almost all of the non-matmul time: the idle gaps
+(CUDA graphs), the small unfused kernels, and the `torch.cat` cache copies.
+I didn't profile vLLM, so that breakdown is inferred, not measured. What the
+engine can't change is the bytes: at 254 GB/s it's at the practical limit,
+so FP16 decode has nothing left to give.
+
+**2. Quantization sped up decode almost in proportion to bytes, but not
+quite.** INT4 reads 3.2x fewer bytes than FP16 and ran 2.9x faster. FP8 reads
+1.8x fewer and ran 1.6x faster. Treating FP16 and INT4 as two points on a
+line (time = bytes ÷ bandwidth + fixed cost) gives 266 GB/s plus ~2.8 ms of
+fixed cost per step. The fixed cost (norms, attention, sampling) doesn't
+shrink with the weights, so it's a bigger share of a short step.
+
+**3. FP8 is ~3.6 ms per step slower than that line predicts.** At 266 GB/s +
+2.8 ms, FP8 should take ~34 ms; it took 37.6. My hypothesis: FP8_DYNAMIC
+quantizes the activations at runtime, which adds a small kernel before each
+of the 252 linear layers per step. At batch size 1 that is pure overhead.
+This is a hypothesis to confirm with a vLLM trace, not a measured result.
+
+**4. My prediction that INT4 wouldn't speed up prefill was wrong for this
+workload.** TTFT p50 went 110 → 69 ms for FP8 and 110 → 80 ms for INT4. The
+chat prompts average only 295 tokens. On the L4 a matmul becomes
+compute-bound at about 400 tokens (121 TFLOPS ÷ 300 GB/s ≈ 400 FLOPs per
+byte, and FP16 weights give one FLOP per byte per token), so these prefills
+are still partly limited by reading the weights, and reading 4-bit weights
+helps. A rough floor for a 295-token prefill, max(bytes ÷ bandwidth,
+FLOPs ÷ peak), is 51 / 27 / 34 ms for FP16 / FP8 / INT4. That ranks the
+three in the same order I measured: FP8 is fastest because it is the only one that
+cuts both bytes and FLOPs time (FP8 tensor cores at ~242 TFLOPS). Each
+measured TTFT is ~40–60 ms above its floor (HTTP, tokenization, scheduling).
+For long prompts (the `long_context` workload) I'd expect INT4's prefill
+advantage to disappear and FP8 to pull further ahead.
+
+**5. Some of the HF → vLLM TTFT gain is a measurement artifact.** The HF
+streamer sends whole words (3,857 chunks for 5,028 tokens), so HF's TTFT
+includes a little word buffering. vLLM sends about one chunk per token (4,994
+chunks). The 225 → 110 ms drop is real, but not all of it is the engine.
+
+**6. One request at a time still wastes the GPU.** Goodput at concurrency 4
+and 16 was 1 request in 32 for every precision, same as the baseline. At
+concurrency 16, p95 TTFT was still 60 s even for INT4. INT4 has room for 79k
+tokens of KV cache but one request uses ~450 (295 in + 157 out on average). Phase 2 (batching) is what
+uses that room.
+
+**7. Cost per token fell 3.1x from the baseline, for 1.9 GSM8K points.**
+$13.01 → $4.17 per 1M output tokens with INT4. FP8 is the safer middle:
+$7.39 for 0.9 points (within noise). At INT4, the 16-bit `lm_head` is now
+~26% of the bytes read per token, about 5 ms of the 20.8 ms step, so it's
+the next target if quality allows.
 
