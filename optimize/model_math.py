@@ -1,14 +1,6 @@
 """
-TokenForge — Phase 1: back-of-envelope model math.
-
-Predict before you measure. Reads a model's config and computes, for
-FP16 / FP8 / INT4 weights:
-  - GPU memory used by the weights
-  - bytes read from memory to generate ONE token
-  - the fastest possible decode speed (the memory-bandwidth ceiling)
-  - how many tokens of KV cache fit in the memory left over
-
-No GPU needed: only the small config.json file is downloaded.
+TokenForge Phase 1: predict weight memory, KV cache room and decode-speed
+ceilings per precision, from the model config alone (no GPU needed).
 
 Run:
     python optimize/model_math.py --model Qwen/Qwen3-8B
@@ -18,11 +10,11 @@ import argparse
 
 from transformers import AutoConfig
 
-# Bytes per weight for each precision we will test.
 WEIGHT_BYTES = {"fp16": 2.0, "fp8": 1.0, "int4": 0.5}
 
 
 def count_params(cfg) -> dict:
+    """Count parameters in the transformer blocks, embeddings and lm_head."""
     h = cfg.hidden_size
     n_layers = cfg.num_hidden_layers
     n_heads = cfg.num_attention_heads
@@ -31,10 +23,10 @@ def count_params(cfg) -> dict:
     inter = cfg.intermediate_size
     vocab = cfg.vocab_size
 
-    attn = (h * n_heads * head_dim       # Q projection
-            + 2 * h * n_kv * head_dim    # K and V projections
-            + n_heads * head_dim * h)    # output projection
-    mlp = 3 * h * inter                  # gate, up and down projections
+    attn = (h * n_heads * head_dim       # Q
+            + 2 * h * n_kv * head_dim    # K, V
+            + n_heads * head_dim * h)    # O
+    mlp = 3 * h * inter                  # gate, up, down
     embed = vocab * h
     lm_head = 0 if cfg.tie_word_embeddings else vocab * h
 
@@ -48,7 +40,7 @@ def count_params(cfg) -> dict:
     }
 
 def kv_bytes_per_token(p: dict, kv_bytes: float = 2.0) -> float:
-    # Every layer stores one Key and one Value vector per KV head, per token.
+    """KV cache bytes per token: K and V, per KV head, per layer."""
     return 2 * p["n_layers"] * p["n_kv"] * p["head_dim"] * kv_bytes
 
 def main():
@@ -67,7 +59,7 @@ def main():
     cfg = AutoConfig.from_pretrained(args.model)
     p = count_params(cfg)
     total = p["blocks"] + p["embed"] + p["lm_head"]
-    # A model with tied embeddings reuses the embedding matrix as its lm_head.
+    # Tied models reuse the embedding matrix as the lm_head.
     head = p["lm_head"] or p["embed"]
     kv_tok = kv_bytes_per_token(p)
     usable = args.gpu_mem_mib * 2**20 * args.mem_util
@@ -88,15 +80,12 @@ def main():
     print("-" * len(header))
 
     for name, wb in WEIGHT_BYTES.items():
-        # Only the transformer blocks get quantized. Embeddings and lm_head
-        # stay 16-bit, which is what typical quantization recipes do.
+        # Only the blocks are quantized; embeddings and lm_head stay 16-bit.
         resident = p["blocks"] * wb + (p["embed"] + p["lm_head"]) * 2
         kv_room = max(0.0, usable - resident) / kv_tok
         row = f"{name:>8} {resident / 1e9:>7.2f}GB {kv_room / 1e3:>8.0f}k tok"
         for t in args.context:
-            # Bytes read to produce ONE token at batch size 1:
-            #   all block weights + the lm_head + the KV cache of every earlier token.
-            # The embedding table is NOT read in full: decoding looks up one row.
+            # Bytes read per decode step. The embedding table is a one-row lookup, not a full read.
             per_step = p["blocks"] * wb + head * 2 + t * kv_tok
             tpot_ms = per_step / bw * 1000
             row += (f" |            {per_step / 1e9:>7.2f}GB"

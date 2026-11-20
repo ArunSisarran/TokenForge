@@ -1,10 +1,6 @@
 """
-TokenForge — Phase 0 baseline server.
-
-PURPOSE: This server is intentionally naive. It serves an LLM the "obvious" way
-(Hugging Face transformers + one request at a time) so that we have a baseline
-to measure every later optimization against. Do not optimize this file — its
-slowness is the point.
+TokenForge Phase 0: naive Hugging Face server, one request at a time.
+Frozen on purpose: it is the "before" measurement. Do not optimize it.
 
 Run:
     MODEL_ID=Qwen/Qwen3-0.6B uvicorn baseline.server:app --port 8000
@@ -22,30 +18,26 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
 
-# Model environment var
 MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen3-0.6B")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Load each param in float16 to take up less space on the GPU
-# CPU are slow at float16 math so if its not run on the GPU use float32
+# CPUs are slow at float16 math, so fall back to float32 there.
 DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
 
-# Load the model once at startup
 print(f"Loading {MODEL_ID} on {DEVICE} ({DTYPE})...")
 _t0 = time.time()
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-# device_map loads the weights straight onto DEVICE (needs accelerate)
 model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=DTYPE, device_map=DEVICE)
-model.eval()  # switches off training-only behavior such as dropout
+model.eval()
 print(f"Loaded in {time.time() - _t0:.1f}s")
 
 PAD_ID = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 
-# Lock allows model.generate() to handle one request at a time, each requests waits for the other to finish
+# One generate() at a time: the bottleneck this baseline exists to measure.
 GPU_LOCK = threading.Lock()
 
-# Make the request schema OpenAI compatible
+
 class Message(BaseModel):
     role: str
     content: str
@@ -66,41 +58,36 @@ app = FastAPI(title="TokenForge baseline")
 
 @app.get("/health")
 def health():
-    # Kubernetes will call an endpoint like this to decide whether the pod is
-    # alive. It is cheap on purpose: it must not touch the model.
+    """Liveness check. Never touches the model."""
     return {"status": "ok", "model": MODEL_ID, "device": DEVICE}
 
 
 def build_inputs(messages: list[Message]):
-    # Chat models were trained on a specific text layout with special tokens
-    # marking who is speaking. apply_chat_template turns our list of messages
-    # into exactly that layout. add_generation_prompt=True appends the
-    # "assistant's turn starts here" marker so the model answers instead of
-    # continuing the user's message. enable_thinking=False turns off Qwen3's
-    # reasoning mode so output lengths stay comparable between runs.
+    """Apply the chat template and tokenize."""
     prompt = tokenizer.apply_chat_template(
         [m.model_dump() for m in messages],
         tokenize=False,
         add_generation_prompt=True,
-        enable_thinking=False,
+        enable_thinking=False,  # keeps output lengths comparable between runs
     )
-    # Tokenization: text -> integer IDs. The model only ever sees these IDs.
     return tokenizer(prompt, return_tensors="pt").to(DEVICE)
 
 
 def generation_kwargs(req: ChatRequest, inputs) -> dict:
+    """Build generate() arguments from the request."""
     kwargs: dict[str, Any] = dict(**inputs, max_new_tokens=req.max_tokens, pad_token_id=PAD_ID)
     if req.ignore_eos:
         kwargs["min_new_tokens"] = req.max_tokens
     if req.temperature > 0:
         kwargs.update(do_sample=True, temperature=req.temperature)
     else:
-        kwargs.update(do_sample=False)  # greedy: always pick the top token
+        kwargs.update(do_sample=False)
     return kwargs
 
 
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatRequest):
+    """OpenAI-compatible chat completion, streaming or not."""
     inputs = build_inputs(req.messages)
     prompt_tokens = inputs["input_ids"].shape[1]
 
@@ -110,21 +97,9 @@ def chat_completions(req: ChatRequest):
         )
 
     with GPU_LOCK:
-        # inference_mode tells PyTorch not to record operations for
-        # backpropagation. We never train here, so this saves memory and time.
         with torch.inference_mode():
-            # What generate() does internally:
-            #   PREFILL: run the whole prompt through the model in one pass.
-            #            Compute-heavy; it decides time-to-first-token (TTFT).
-            #   DECODE:  loop: predict ONE token, append it, repeat. Each step
-            #            re-reads all the weights from GPU memory to produce a
-            #            single token — memory-bandwidth-bound, and it decides
-            #            inter-token latency. The KV cache stores attention
-            #            keys/values from earlier tokens so they aren't
-            #            recomputed every step.
             output = model.generate(**generation_kwargs(req, inputs))
 
-    # generate() returns prompt + new tokens; slice off the prompt.
     new_tokens = output[0, prompt_tokens:]
     text = tokenizer.decode(new_tokens, skip_special_tokens=True)
     completion_tokens = len(new_tokens)
@@ -141,8 +116,6 @@ def chat_completions(req: ChatRequest):
                 "finish_reason": "length" if completion_tokens >= req.max_tokens else "stop",
             }
         ],
-        # Token counts are how LLM work is measured and billed. The benchmark
-        # will use them to compute tokens/sec and cost per 1M tokens.
         "usage": {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
@@ -150,13 +123,9 @@ def chat_completions(req: ChatRequest):
         },
     }
 
-# Streaming with Server-Sent Events (SSE)
-# sends each piece of text as soon as it exists.
 
-# generate() blocks until it finishes, so we run it in a background thread.
-# TextIteratorStreamer is a queue: generate() pushes decoded text into it,
-# and this function pulls text out and sends it to the client.
 def stream_tokens(req: ChatRequest, inputs, prompt_tokens: int):
+    """Stream the reply as SSE chunks; generate() runs in a thread feeding the streamer."""
     streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
     request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
@@ -187,9 +156,7 @@ def stream_tokens(req: ChatRequest, inputs, prompt_tokens: int):
                 if text_piece:
                     yield chunk({"content": text_piece})
         finally:
-            # Even if the client disconnects, wait for generate() to finish
-            # before releasing the lock. (A real engine would cancel the
-            # request and free its memory — another thing vLLM does for us.)
+            # Hold the lock until generate() ends, even if the client disconnected.
             worker.join()
 
     n = result["completion_tokens"]

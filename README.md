@@ -51,7 +51,7 @@ embedding table is a single-row lookup, not a full read). At the L4's
 a time is the problem.
 
 **4. Prefill is ~200x cheaper per token than decode.** TTFT at concurrency 1
-grew as ~150 ms + 0.3 ms per prompt token, about 3,500 prompt tokens/s,
+grew as ~160 ms + 0.31 ms per prompt token, about 3,200 prompt tokens/s,
 versus 15 tok/s for generation. Prefill processes the whole prompt in one
 pass over the weights; decode re-reads them for every token.
 
@@ -96,34 +96,15 @@ Grouped-query attention (8 KV heads for 32 query heads) makes it 4x smaller.
 | Kernels launched per step | 2,074 | 2,074 |
 | Model-math ceiling | 50.7 ms | 55.0 ms |
 
-**1. Kernel launch gaps are small.** I expected idle time between the ~2,000
-kernels per step to explain most of the gap to the ceiling. The trace showed
-only ~5%: each matmul runs ~230 µs, long enough for Python to queue the next
-kernels, so the GPU rarely waits. CUDA graphs can recover at most that 5% here.
+**1. Kernel launch gaps are small:** only ~5% of the step is GPU idle time, so CUDA graphs can recover at most that.
 
-**2. The matmul kernels themselves run near the practical limit.** They read
-~15.1 GB in 58.8 ms, about 257 GB/s or 86% of the L4's 300 GB/s spec. Real
-kernels rarely exceed 85–90% of spec bandwidth.
+**2. The matmuls already run near the practical limit:** ~257 GB/s, 86% of the L4's 300 GB/s spec.
 
-**3. Kernel timing confirms decode is memory-bound.** Decode runs 253 `gemv`
-(matrix × vector) kernels per step: 7 per layer (Q, K, V, O, gate, up, down)
-× 36 layers + 1 for the `lm_head`. Their time splits 79% / 21% between the
-MLP + `lm_head` and the attention projections; their bytes split 80% / 20%.
-Time tracks bytes.
+**3. Decode is memory-bound:** the 253 `gemv` kernels split their time 79/21 between MLP + `lm_head` and attention, matching their 80/20 split in bytes.
 
-**4. Hugging Face copies the whole KV cache every step.** Each step runs 72
-`torch.cat` copy kernels (2 per layer) that rebuild the cache to append one
-token. Their share doubled from 2.2% to 4.1% of the step between 512 and 2048
-tokens of context, and the total cost grows quadratically with generation
-length. This is the problem vLLM's PagedAttention avoids by preallocating
-cache blocks and writing in place.
+**4. Hugging Face copies the whole KV cache every step:** 72 `torch.cat` kernels per step, rising from 2.2% to 4.1% of the step from 512 to 2048 tokens of context. PagedAttention avoids this.
 
-**5. Prefill is compute-bound but uses about a third of peak.** The GPU was
-97–99% busy. 512 tokens took 180 ms (~40 TFLOPS) and 2048 tokens 659 ms
-(~43 TFLOPS), against roughly 120 TFLOPS FP16 peak. Unfused elementwise ops
-(such as RMSNorm's separate squaring step) took 9% of prefill at 512 tokens
-and 17% at 2048, which kernel fusion in engines like vLLM removes. Attention
-itself was under 2% of decode time at these context lengths.
+**5. Prefill is compute-bound but reaches only about a third of peak:** ~40–43 TFLOPS against ~120, with unfused elementwise ops at 9–17% of prefill time.
 
 **What this means for the rest of Phase 1:** at one request at a time, the HF
 baseline is already near the practical bandwidth limit, so a better engine

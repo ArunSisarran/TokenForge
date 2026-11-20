@@ -59,8 +59,8 @@ later phase would just be "I installed a tool."
 - **`plot.py`** draws p95 TTFT and p95 TPOT against output throughput, one
   line per result file, with a log-scale y-axis.
 
-**Metric definitions** (the same as vLLM's own benchmark, so I can cross-check
-later):
+**Metric definitions** (TPOT uses the same formula as vLLM's benchmark, so I
+can cross-check later):
 
 | Metric | Definition |
 | --- | --- |
@@ -133,8 +133,9 @@ the L4's ~300 GB/s, that sets a floor of ~51 ms per token. Measured TPOT was
 one request at a time is the real problem.
 
 **4. Prefill is ~200x cheaper per token than decode.** At concurrency 1,
-TTFT grew as roughly 150 ms + 0.3 ms per prompt token, about 3,500 prompt
-tokens/s, compared with 15 tok/s for generation. Prefill handles the whole
+TTFT grew as roughly 160 ms + 0.31 ms per prompt token (a straight-line fit
+over the 32 requests), about 3,200 prompt tokens/s, compared with 15 tok/s
+for generation. Prefill handles the whole
 prompt in one pass over the weights, while decode re-reads all the weights
 for every single token.
 
@@ -151,12 +152,18 @@ concurrency 16. Goodput shows it's unusable.
   holds text until it has a complete word, so stream chunks aren't tokens, and
   TTFT includes a little word buffering. Exact token counts come from the
   final usage chunk, so throughput and TPOT are unaffected.
-- **One run per configuration.** The plan calls for 3 runs and the median.
-  At 336 s per level with almost no variance (TPOT p50 to p99 spans 65.6 to
-  66.9 ms), I accepted one run for the baseline.
-- **Concurrency 32 and 64 were skipped.** With TTFT growing linearly with the
-  queue, they would only take longer to show the same thing (~10.5 s per
-  request ahead of you).
+- **One run per configuration, not the median of 3.** The lock makes every
+  level an identical sequential run of the same 32 requests, so the three
+  levels act as repeats: wall time was 336.30 s, 336.29 s and 336.34 s, and
+  TPOT p50 was 65.6 ms at all three (p99 within 66.9 ms). Run-to-run
+  variance is far below any effect later phases should show. Later phases
+  that batch requests won't have this property and will need repeat runs.
+- **Concurrency 1/4/16 instead of 1/8/32/64.** With one request at a time,
+  TTFT is predictable from the queue alone (~10.5 s per request ahead), and
+  finding 2 confirmed that at c=4. Higher levels would cost the same 336 s of
+  GPU time each and only push the number further up the same line. The full
+  sweep starts with vLLM in Phase 2, where concurrency actually changes
+  throughput.
 
 ---
 

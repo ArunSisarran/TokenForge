@@ -1,14 +1,5 @@
 """
-TokenForge — plot benchmark results.
-
-Draws the chart you will put in your README: throughput (x) vs latency (y),
-one line per run, one point per concurrency level.
-
-WHY THIS CHART: serving is a trade-off. Pushing more concurrent requests
-raises throughput (cheaper per token) but also raises latency (worse for each
-user). Every engine/config traces a curve. A better system's curve sits
-further RIGHT (more throughput) and LOWER (less latency). A single number
-like "500 tok/s" hides the latency you paid for it; the curve doesn't.
+TokenForge: plot p95 latency vs output throughput, one line per result file.
 
 Run:
     python bench/plot.py bench/results/*.json --out bench/results/latency_vs_throughput.png
@@ -20,7 +11,7 @@ from pathlib import Path
 
 import matplotlib
 
-matplotlib.use("Agg")  # render to a file; no display needed (works on servers)
+matplotlib.use("Agg")  # render to a file; no display needed
 import matplotlib.pyplot as plt
 
 
@@ -37,7 +28,6 @@ def main():
         label = data["metadata"]["args"]["label"]
         rows = data["summary"]
         x = [r["output_tok_per_s"] for r in rows]
-        # p95, not p50: we care about the unlucky users too.
         ttft = [r["ttft_ms_p95"] for r in rows]
         tpot = [r["tpot_ms_p95"] for r in rows]
 
@@ -54,7 +44,7 @@ def main():
     ax_tpot.set_ylabel("TPOT p95 (ms)")
     for ax in (ax_ttft, ax_tpot):
         ax.set_xlabel("Output throughput (tokens/s)")
-        ax.set_yscale("log")  # latencies span orders of magnitude across configs
+        ax.set_yscale("log")
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8)
 

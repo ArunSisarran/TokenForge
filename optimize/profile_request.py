@@ -1,9 +1,6 @@
 """
-TokenForge — Phase 1: profile one request.
-
-Runs prefill and decode manually (what generate() does internally), times
-each phase, converts the times into hardware efficiency, and records a GPU
-trace you can open at https://ui.perfetto.dev
+TokenForge Phase 1: time prefill and decode for one request, report TFLOPS
+and GB/s, and export a GPU trace (open it at https://ui.perfetto.dev).
 
 Run from the repo root, on a GPU:
     python -m optimize.profile_request --model Qwen/Qwen3-8B
@@ -22,8 +19,7 @@ from optimize.model_math import count_params, kv_bytes_per_token
 
 
 def make_prompt_ids(tokenizer, n_tokens: int, device: str):
-    # Content doesn't matter for speed, only length. Repeat a sentence and cut
-    # it to exactly n_tokens.
+    """Build a prompt of exactly n_tokens from repeated filler text."""
     text = "The quick brown fox jumps over the lazy dog. " * (n_tokens // 5 + 10)
     ids = tokenizer(text, return_tensors="pt").input_ids[:, :n_tokens]
     return ids.to(device)
@@ -31,9 +27,7 @@ def make_prompt_ids(tokenizer, n_tokens: int, device: str):
 
 @torch.inference_mode()
 def prefill(model, ids):
-    # One forward pass over the WHOLE prompt. It fills the KV cache and gives
-    # the logits for the next token. logits_to_keep=1: only compute the scores
-    # for the last position, the only one we need.
+    """One forward pass over the whole prompt; returns the next token and KV cache."""
     out = model(input_ids=ids, use_cache=True, logits_to_keep=1)
     next_tok = out.logits[:, -1:].argmax(dim=-1)
     return next_tok, out.past_key_values
@@ -41,15 +35,12 @@ def prefill(model, ids):
 
 @torch.inference_mode()
 def decode_step(model, tok, past):
-    # One forward pass over ONE new token, reusing the KV cache of everything
-    # before it. This is repeated once per generated token.
+    """One forward pass over one token, reusing the KV cache."""
     out = model(input_ids=tok, past_key_values=past, use_cache=True)
     return out.logits[:, -1:].argmax(dim=-1), out.past_key_values
 
 def timed(fn):
-    # GPU work is ASYNCHRONOUS: Python queues kernels and moves on immediately.
-    # synchronize() waits until the GPU has really finished, so we time the
-    # work and not just the queueing.
+    """Run fn and return (result, seconds), timing the GPU work rather than the kernel queueing."""
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     result = fn()
@@ -79,20 +70,17 @@ def main():
     ids = make_prompt_ids(tokenizer, args.prompt_tokens, "cuda")
     T = ids.shape[1]
 
-    # --- Warmup: the first passes pay one-time costs (kernel selection,
-    # memory allocation). Run a few and throw the timings away.
+    # Warmup: skip one-time costs (kernel selection, allocation).
     nxt, past = prefill(model, ids)
     for _ in range(5):
         nxt, past = decode_step(model, nxt, past)
 
-    # --- Time prefill (fresh cache each time), take the median of 3.
     prefill_times = []
     for _ in range(3):
         _, t = timed(lambda: prefill(model, ids))
         prefill_times.append(t)
     t_prefill = statistics.median(prefill_times)
 
-    # --- Time decode: one prefill, then many single-token steps.
     nxt, past = prefill(model, ids)
     step_times = []
     for _ in range(args.decode_steps):
@@ -100,12 +88,9 @@ def main():
         step_times.append(t)
     t_step = statistics.median(step_times)
 
-    # --- Turn times into hardware efficiency.
-    # A matmul does 2 FLOPs (multiply + add) per weight per token.
-    # Prefill runs every block weight over T tokens, and lm_head over 1 token.
+    # 2 FLOPs per weight per token; the lm_head only runs on the last token.
     flops = 2 * p["blocks"] * T + 2 * head
-    # A decode step reads every block weight, the lm_head, and the KV cache.
-    ctx = T + args.decode_steps // 2   # average context length during timing
+    ctx = T + args.decode_steps // 2   # average context during timing
     bytes_step = p["blocks"] * 2 + head * 2 + ctx * kv_tok
     gbs = bytes_step / t_step / 1e9
 
@@ -117,9 +102,7 @@ def main():
     print(f"Ratio    one decode token costs {t_step / (t_prefill / T):,.0f}x one prefill token")
     print(f"Memory   peak allocated {torch.cuda.max_memory_allocated() / 1e9:.2f} GB\n")
 
-    # --- Record a trace of one prefill + a few decode steps.
-    # record_function puts a named block on the timeline. synchronize() inside
-    # each block makes the block's length match the GPU work it launched.
+    # synchronize() inside each block makes its length match the GPU work it launched.
     Path(args.trace).parent.mkdir(parents=True, exist_ok=True)
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
         with record_function("prefill"):
@@ -130,7 +113,6 @@ def main():
                 nxt, past = decode_step(model, nxt, past)
                 torch.cuda.synchronize()
 
-    # Which GPU kernels took the most time?
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=15))
     prof.export_chrome_trace(args.trace)
     print(f"Trace saved to {args.trace}. Open it at https://ui.perfetto.dev")

@@ -1,24 +1,10 @@
 """
-TokenForge — workload generator.
+TokenForge: generate the fixed, seeded benchmark workloads.
+Never edit a committed workload; write a new file (e.g. chat_v2.jsonl) instead.
 
-WHY THIS EXISTS: A benchmark is only meaningful if every run sends the SAME
-requests. So we generate the workloads once, save them as files, commit them
-to git, and never change them. If you change a workload, every old result
-becomes incomparable — so make a new file (chat_v2.jsonl) instead.
-
-Each workload stresses a different part of the system:
-
-  chat.jsonl          Mixed lengths, like real chat traffic. The general case.
-  shared_prefix.jsonl Every request starts with the same long system prompt.
-                      Shows off prefix caching (Phase 2) and cache-aware
-                      routing (Phase 6): the shared part can be computed once.
-  long_context.jsonl  Very long inputs, short outputs. Stresses PREFILL
-                      (compute-bound) and KV cache memory.
-
-The text is synthetic (no internet needed, and fully reproducible from the
-seed). What matters for performance is the LENGTH distribution, not whether
-the prompts are interesting. Lengths here are in words; a word is ~1.3
-tokens for English. The benchmark records exact token counts from the server.
+  chat.jsonl           mixed lengths, general serving
+  shared_prefix.jsonl  same ~2k-token system prompt, for prefix caching
+  long_context.jsonl   ~8k-token inputs, for prefill and KV cache memory
 
 Run:
     python bench/make_workloads.py --out-dir bench/workloads
@@ -30,7 +16,6 @@ import math
 import random
 from pathlib import Path
 
-# A bank of neutral sentences we shuffle into "documents" of any length.
 SENTENCES = [
     "The committee reviewed the quarterly figures before the meeting ended.",
     "Rainfall in the northern valley was higher than the ten year average.",
@@ -79,14 +64,12 @@ def make_text(rng: random.Random, n_words: int) -> str:
 
 
 def lognormal_int(rng, median, sigma, lo, hi) -> int:
-    """
-    Real request lengths are skewed: most are short, a few are very long.
-    A log-normal distribution has exactly that shape. We clip the extremes.
-    """
+    """Sample a skewed (log-normal) length, clipped to [lo, hi]."""
     return int(min(hi, max(lo, rng.lognormvariate(math.log(median), sigma))))
 
 
 def chat_workload(rng, n):
+    """Chat requests with log-normal input and output lengths."""
     rows = []
     for i in range(n):
         context_words = lognormal_int(rng, median=150, sigma=1.0, lo=10, hi=1500)
@@ -101,8 +84,7 @@ def chat_workload(rng, n):
 
 
 def shared_prefix_workload(rng, n):
-    # ONE system prompt (~1,500 words ≈ 2,000 tokens) reused by every request.
-    # Real apps do this constantly: long instructions + a short user question.
+    """Requests sharing one ~2k-token system prompt, each with a short question."""
     system = "You are a helpful analyst. Use this background:\n" + make_text(rng, 1500)
     rows = []
     for i in range(n):
@@ -119,6 +101,7 @@ def shared_prefix_workload(rng, n):
 
 
 def long_context_workload(rng, n):
+    """~8k-token documents to summarize, short outputs."""
     rows = []
     for i in range(n):
         doc = make_text(rng, 6000)  # ≈ 8k tokens
@@ -131,7 +114,7 @@ def long_context_workload(rng, n):
 
 
 def write_jsonl(path: Path, rows):
-    # JSONL = one JSON object per line. Easy to stream, diff and append to.
+    """Write one JSON object per line."""
     with path.open("w") as f:
         for r in rows:
             f.write(json.dumps(r) + "\n")
@@ -141,7 +124,7 @@ def write_jsonl(path: Path, rows):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--out-dir", default="bench/workloads")
-    p.add_argument("--seed", type=int, default=42)  # same seed = same files
+    p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num-chat", type=int, default=500)
     p.add_argument("--num-prefix", type=int, default=200)
     p.add_argument("--num-long", type=int, default=50)
@@ -149,8 +132,7 @@ def main():
 
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    # A separate RNG per workload, so changing one count never changes the
-    # contents of the other files.
+    # Separate RNG per workload, so changing one count never changes the other files.
     write_jsonl(out / "chat.jsonl", chat_workload(random.Random(args.seed), args.num_chat))
     write_jsonl(out / "shared_prefix.jsonl",
                 shared_prefix_workload(random.Random(args.seed + 1), args.num_prefix))
