@@ -123,7 +123,7 @@ Full write-up (in progress): [docs/phase-1-optimization.md](docs/phase-1-optimiz
     - [x] Model math: memory, KV cache, and decode ceilings per precision
     - [x] Profiling: prefill vs decode, kernel breakdown
     - [x] FP8 and INT4 quantization
-    - [ ] Quality evals (perplexity, task accuracy)
+    - [x] Quality evals (perplexity, task accuracy)
     - [ ] Speed benchmarks: FP16 vs FP8 vs INT4
     - [ ] FP8 KV cache and speculative decoding
 - [ ] **Phase 2: Inference engine.** vLLM tuning (continuous batching, prefix caching, chunked prefill), comparison with SGLang

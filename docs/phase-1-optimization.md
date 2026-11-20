@@ -11,8 +11,8 @@ one variable at a time.
 | 1. Model math: memory, KV cache and decode ceilings per precision | ✅ done |
 | 2. Profiling: where prefill and decode time goes | ✅ done |
 | 3. FP8 and INT4 quantization | ✅ done |
-| 4. Quality evals (perplexity, task accuracy) | ⬜ next |
-| 5. Speed benchmarks: FP16 vs FP8 vs INT4 in vLLM | ⬜ |
+| 4. Quality evals (perplexity, task accuracy) | ✅ done |
+| 5. Speed benchmarks: FP16 vs FP8 vs INT4 in vLLM | ⬜ next |
 | 6. FP8 KV cache and speculative decoding | ⬜ |
 
 ---
@@ -234,3 +234,82 @@ read "KV cache" as a generic key-value store rather than the transformer
 cache. That comes from the ambiguous prompt, not from quantization damage,
 and a single greedy sample can't measure quality. Piece 4 measures that with
 perplexity and task accuracy against BF16.
+
+---
+
+## Piece 4: Quality evals (lm-evaluation-harness)
+
+Same evals, same settings, on all three models: WikiText word perplexity
+(62 documents) and GSM8K (all 1,319 problems, 5-shot, greedy). The vLLM
+backend runs the real quantized kernels: `CutlassFP8ScaledMMLinearKernel`
+for FP8 and `MarlinLinearKernel` for INT4. No chat template, so absolute
+GSM8K scores won't match Qwen's published numbers; the differences between
+the three models are what's being measured.
+
+```bash
+lm_eval --model vllm \
+  --model_args pretrained=$MODEL,dtype=auto,max_model_len=4096,gpu_memory_utilization=0.85 \
+  --tasks wikitext,gsm8k --batch_size auto --output_path optimize/evals/
+```
+
+Environment: NVIDIA L4 (driver 595.112.07), vLLM 0.34.0, torch 2.14.0
+(CUDA 13.0 build), transformers 5.22.2, lm-eval 0.4.13. Raw results are in
+`optimize/evals/*/results_*.json`.
+
+### Results
+
+| | WikiText word PPL ↓ | Δ PPL | GSM8K strict ↑ | Δ GSM8K | GSM8K recovery |
+| --- | --- | --- | --- | --- | --- |
+| BF16 | 12.743 | | 87.64 ± 0.91 | | |
+| FP8 (W8A8 dynamic) | 12.867 | +0.97% | 86.73 ± 0.93 | −0.91 pts | 99.0% |
+| INT4 (GPTQ W4A16 g128) | 13.242 | +3.92% | 85.75 ± 0.96 | −1.90 pts | 97.8% |
+
+GSM8K flexible-extract shows the same pattern: 88.32 → 87.34 → 86.50.
+Recovery = quantized score ÷ BF16 score.
+
+What vLLM reported while loading each model (85% of 22.04 GiB, 4,096-token
+max length):
+
+| | Weights in GPU memory | KV cache | Max concurrent 4k-token requests |
+| --- | --- | --- | --- |
+| BF16 | 15.27 GiB | 10,240 tokens | 2.5 |
+| FP8 | 8.80 GiB | 56,320 tokens | 13.75 |
+| INT4 | 5.68 GiB | 79,360 tokens | 19.4 |
+
+### Findings
+
+**1. FP8 is nearly free in quality.** Perplexity rose 1% and GSM8K fell
+0.9 points, which is within one standard error. On these evals I can't tell
+FP8 apart from BF16.
+
+**2. INT4 costs about 4x more quality than FP8, but still keeps ~98% of
+it.** Perplexity rose 3.9% and GSM8K fell 1.9 points. Treating the two
+scores as independent, the GSM8K gap is about 1.4 standard errors (√(0.91² +
+0.96²) ≈ 1.3), so it's suggestive but not proven at 95%. Both models answered
+the same 1,319 questions, so a paired comparison would be much tighter; that
+needs `--log_samples`, which this run didn't save. Perplexity has no sampling
+noise here (fixed text, deterministic scoring), so its ordering is real.
+
+**3. Perplexity and GSM8K agree on the ordering.** BF16 > FP8 > INT4 on
+both. The fewer bits per weight, the more the output distribution drifts,
+and GSM8K's long multi-step generations turn that drift into wrong answers.
+
+**4. Weight memory matched the model math.** 15.27 / 8.80 / 5.68 GiB versus
+predicted 16.4 / 9.43 / 6.07 GB (15.3 / 8.8 / 5.65 GiB).
+
+**5. KV cache room was far smaller than the model math predicted, and that
+hits BF16 hardest.** I predicted ~36k / 84k / 107k tokens at 90% memory.
+vLLM got 10k / 56k / 79k at 85%. The model math ignored ~1.3 GiB of peak
+activations and other runtime memory, and 5% less utilization costs another
+~1.1 GiB. That overhead is roughly fixed, so it takes most of BF16's small
+leftover: BF16 can hold only 2.5 full-length requests at once, while INT4
+holds 19. **Quantization's biggest win for serving may be batch size, not
+per-token speed.** That's what Phase 2 tests.
+
+**6. Eval wall time hints at that already.** BF16 took 38 min, FP8 17 min,
+INT4 18 min. These weren't controlled benchmarks (they include engine
+start-up), but BF16's tiny KV cache limits how many sequences vLLM can batch.
+INT4 was no faster than FP8 despite more KV room and fewer bytes: evals are
+mostly prefill, which is compute-bound, and FP8 runs on FP8 tensor cores
+while W4A16 still does FP16 math. Piece 5 measures this properly.
+
