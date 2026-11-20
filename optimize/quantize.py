@@ -2,7 +2,8 @@
 TokenForge Phase 1: quantize the model to FP8 (W8A8 dynamic) or INT4 (GPTQ
 W4A16, group 128) with LLM Compressor, keeping lm_head 16-bit.
 
-Run from the repo root, on a GPU (needs ~20 GB of free CPU RAM):
+Run from the repo root, on a GPU (needs ~20 GB of free CPU RAM), in a venv
+with requirements-quantize.txt (it conflicts with vLLM):
     python -m optimize.quantize --scheme fp8
     python -m optimize.quantize --scheme int4
 """

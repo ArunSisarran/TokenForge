@@ -151,7 +151,8 @@ TokenForge/
 │   ├── model_math.py       # predicts memory, KV cache size, decode ceilings
 │   └── profile_request.py  # profiles prefill and decode, exports a GPU trace
 ├── docs/                   # one write-up per phase
-└── requirements.txt        # all Python dependencies
+├── requirements.txt        # all Python dependencies except quantization
+└── requirements-quantize.txt  # llmcompressor, in its own venv (conflicts with vLLM)
 ```
 
 ---

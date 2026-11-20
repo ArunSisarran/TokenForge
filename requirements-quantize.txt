@@ -1,0 +1,4 @@
+# Only for optimize/quantize.py, in its own venv: llmcompressor pins a
+# compressed-tensors version that conflicts with vLLM in requirements.txt.
+llmcompressor==0.15.0  # version that produced the Phase 1 FP8 and INT4 models
+datasets>=2.19
