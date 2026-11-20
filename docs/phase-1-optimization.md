@@ -10,8 +10,8 @@ one variable at a time.
 | --- | --- |
 | 1. Model math: memory, KV cache and decode ceilings per precision | ✅ done |
 | 2. Profiling: where prefill and decode time goes | ✅ done |
-| 3. FP8 and INT4 quantization | ⬜ next |
-| 4. Quality evals (perplexity, task accuracy) | ⬜ |
+| 3. FP8 and INT4 quantization | ✅ done |
+| 4. Quality evals (perplexity, task accuracy) | ⬜ next |
 | 5. Speed benchmarks: FP16 vs FP8 vs INT4 in vLLM | ⬜ |
 | 6. FP8 KV cache and speculative decoding | ⬜ |
 
@@ -180,7 +180,7 @@ about 10–15% for vLLM FP16 at `--max-num-seqs 1`. The large levers are:
 
 ---
 
-## Piece 3: Quantization (next)
+## Piece 3: Quantization (`optimize/quantize.py`)
 
 **Plan:** `optimize/quantize.py --scheme {fp8,int4}` using LLM Compressor.
 
@@ -200,5 +200,37 @@ about 10–15% for vLLM FP16 at `--max-num-seqs 1`. The large levers are:
 | FP8 | ~9.4 GB | Faster prefill (FP8 tensor cores) and faster decode (half the bytes) |
 | INT4 | ~6.1 GB (including ~3% for group-128 scales) | Fastest decode, little or no prefill gain (math still runs in 16-bit) |
 
-Results, quality evals (piece 4) and speed benchmarks (piece 5) will be
-added here as each piece is measured.
+```bash
+python -m optimize.quantize --scheme fp8
+python -m optimize.quantize --scheme int4
+```
+
+### Results (L4, llmcompressor 0.15)
+
+| | Predicted size | Measured size | Time to quantize | Peak CPU RAM |
+| --- | --- | --- | --- | --- |
+| FP8 | 9.43 GB | 9.44 GB | 0.1 min | 16.3 GB |
+| INT4 | 6.07 GB | 6.07 GB | 27.9 min | not recorded |
+
+### Findings
+
+**1. Sizes on disk match the model math almost exactly.** FP8 came out at
+6.95B block weights × 1 byte + 2.48 GB of 16-bit embeddings and `lm_head`.
+INT4 came out at 6.95B × 0.5 bytes + 0.11 GB of group-128 scales + the same
+2.48 GB. The 16-bit embeddings and `lm_head` are now 41% of the INT4 file.
+
+**2. GPTQ took hundreds of times longer than FP8.** FP8_DYNAMIC only computes one scale
+per output row from the weights and rounds, so it needs no data and took
+a few seconds (the script rounds to 0.1 min). GPTQ ran 512 calibration conversations through every layer
+and solved a rounding problem per weight matrix, which took 28 minutes. That
+cost is paid once, offline.
+
+**3. Peak CPU RAM for FP8 (16.3 GB) was the BF16 model itself.** The model
+was loaded on the CPU in BF16 (16.4 GB) and quantized in place, so nothing
+else meaningful was added.
+
+**4. Both models still produce fluent answers, which proves little.** Both
+read "KV cache" as a generic key-value store rather than the transformer
+cache. That comes from the ambiguous prompt, not from quantization damage,
+and a single greedy sample can't measure quality. Piece 4 measures that with
+perplexity and task accuracy against BF16.
