@@ -130,6 +130,8 @@ weights (batching, Phase 2).
 
 **9. Cost fell 3.1x for 1.9 GSM8K points** ($13.01 → $4.17 per 1M tokens with INT4). Goodput at concurrency 16 is still 1 in 32, so batching (Phase 2) is the next big lever.
 
+**10. An FP8 KV cache made long-context decode 7.2% faster** (24.55 → 22.78 ms at ~6.8k tokens, matching the 0.5 GB of KV bytes it saves) for +0.10% perplexity, and KV room went 86k → 166k tokens. Caveat: vLLM also switched the attention backend (FlashAttention → FlashInfer) for FP8 KV, so the speed number is confounded until a control run. On short chat prompts it changed nothing, as predicted.
+
 Full write-up (in progress): [docs/phase-1-optimization.md](docs/phase-1-optimization.md)
 
 ---
@@ -143,7 +145,8 @@ Full write-up (in progress): [docs/phase-1-optimization.md](docs/phase-1-optimiz
     - [x] FP8 and INT4 quantization
     - [x] Quality evals (perplexity, task accuracy)
     - [x] Speed benchmarks: FP16 vs FP8 vs INT4
-    - [ ] FP8 KV cache and speculative decoding
+    - [x] FP8 KV cache
+    - [ ] Speculative decoding
 - [ ] **Phase 2: Inference engine.** vLLM tuning (continuous batching, prefix caching, chunked prefill), comparison with SGLang
 - [ ] **Phase 3: Gateway.** API keys, per-key rate limiting (Redis), streaming proxy
 - [ ] **Phase 4: Containers.** Multi-stage Docker images, docker-compose stack

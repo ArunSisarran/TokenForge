@@ -13,7 +13,8 @@ one variable at a time.
 | 3. FP8 and INT4 quantization | ✅ done |
 | 4. Quality evals (perplexity, task accuracy) | ✅ done |
 | 5. Speed benchmarks: FP16 vs FP8 vs INT4 in vLLM | ✅ done |
-| 6. FP8 KV cache and speculative decoding | ⬜ next |
+| 6a. FP8 KV cache | ✅ done |
+| 6b. Speculative decoding | ⬜ next |
 
 ---
 
@@ -420,4 +421,113 @@ $13.01 → $4.17 per 1M output tokens with INT4. FP8 is the safer middle:
 $7.39 for 0.9 points (within noise). At INT4, the 16-bit `lm_head` is now
 ~26% of the bytes read per token, about 5 ms of the 20.8 ms step, so it's
 the next target if quality allows.
+
+---
+
+## Piece 6a: FP8 KV cache
+
+`--kv-cache-dtype fp8` stores each token's keys and values in 8 bits instead
+of 16, halving the KV cache from 144 KB to 72 KB per token. The weights stay
+the same (INT4, where the KV cache is the largest share of bytes read), so
+the KV precision was meant to be the only variable. No calibrated KV scales
+were used.
+
+**It wasn't the only variable.** The server logs show vLLM picked the
+FLASH_ATTN attention backend for every 16-bit KV run and FLASHINFER for every
+FP8 KV run. With FP8 KV the candidate list drops to `['FLASHINFER',
+'TRITON_ATTN']`, because FlashAttention can't read an FP8 KV cache on this
+GPU. So the comparison below changes both the KV precision and the attention
+kernel. A control run (16-bit KV, FlashInfer forced) is needed to separate them.
+
+```bash
+lm_eval --model vllm \
+  --model_args pretrained=$M,dtype=auto,max_model_len=4096,gpu_memory_utilization=0.85,kv_cache_dtype=fp8 \
+  --tasks wikitext,gsm8k --batch_size auto --output_path optimize/evals/kv-fp8/
+# chat: piece 5 settings. long_context: --max-model-len 16384, concurrency 1 only
+# (at --max-num-seqs 1, higher levels only add queueing).
+vllm serve $M --kv-cache-dtype fp8 ...   # vs. the default (16-bit KV)
+```
+
+The `long_context` prompts average 6,726 tokens (215,222 over 32 requests),
+so the average context during decode is about 6,790 tokens.
+
+### Results
+
+| KV cache (INT4 weights) | Workload | TPOT p50 | Out tok/s | TTFT p50 | $ / 1M tokens |
+| --- | --- | --- | --- | --- | --- |
+| 16-bit | chat | 20.81 ms | 46.64 | 80 ms | $4.17 |
+| FP8 | chat | 20.76 ms | 46.78 | 82 ms | $4.16 |
+| 16-bit | long_context | 24.55 ms | 24.54 | 2,100 ms | $7.92 |
+| FP8 | long_context | 22.78 ms | 25.77 | 2,076 ms | $7.54 |
+
+| INT4 weights | WikiText word PPL | GSM8K strict |
+| --- | --- | --- |
+| 16-bit KV (piece 4) | 13.242 | 85.75 ± 0.96 |
+| FP8 KV | 13.255 (+0.10%) | 86.73 ± 0.93 |
+
+KV cache room from the server logs (INT4 weights, 85% memory):
+
+| | 16-bit KV (FLASH_ATTN) | FP8 KV (FLASHINFER) |
+| --- | --- | --- |
+| Speed runs (`--max-num-seqs 1`) | 86,016 tokens | 165,888 tokens (1.93x) |
+| Eval runs (default 256 seqs) | 79,360 tokens | 147,456 tokens (1.86x) |
+
+### Findings
+
+**1. The decode saving matched the bytes almost exactly, but it's
+confounded.** At 6,790 tokens of
+context the KV cache is 1.00 GB per step in 16-bit and 0.50 GB in FP8. Model
+math predicted 19.1 → 17.4 ms, a 1.7 ms saving. I measured 24.55 → 22.78 ms,
+a 1.77 ms saving (−7.2%). The saved 0.50 GB in 1.77 ms works out to ~280 GB/s,
+so the attention kernel reads the KV cache at about the same speed the matmuls
+read weights. Decode attention is memory-bound too. Because the backend also
+changed (FlashAttention → FlashInfer), part of the 1.77 ms could come from the
+kernel, in either direction. The close match to the byte prediction suggests
+the backend effect is small, but I haven't measured it.
+
+**2. On short chat prompts it made no difference, as predicted.** At ~450
+tokens of context the KV cache is ~66 MB of the ~4.8 GB read per step (~1%),
+so halving it should save ~0.1 ms. I measured 20.81 → 20.76 ms, inside the
+noise.
+
+**3. Long context costs what the bytes say.** Going from chat to
+long_context with a 16-bit KV cache added 3.7 ms per step for ~0.9 GB more
+KV read, about 250 GB/s. At 6.8k tokens the KV cache is already ~17% of
+the bytes per step for INT4 weights.
+
+**4. FP8 KV didn't change prefill.** TTFT went 2,100 → 2,076 ms (−1%). The
+cache is written once during prefill, and the attention math still runs in
+16-bit, so there's nothing to save. Prefill ran at ~3,200 tokens/s, about
+51 TFLOPS counting attention, or ~43% of the L4's 16-bit peak.
+
+**5. A 1-second TTFT is out of reach for 6.7k-token prompts on one L4.** The
+prefill is ~107 TFLOPs of work. Even at the full 121 TFLOPS peak that takes
+0.88 s, before any overhead, so goodput was 0 for both runs. Only fewer FLOPs
+(FP8 tensor cores, which double the peak) or more GPUs can fix this, not
+batching or scheduling.
+
+**6. The quality cost is too small to measure, and GSM8K showed me its noise
+floor.** Perplexity rose 0.10%. Perplexity is deterministic, so this is real
+but tiny. GSM8K went *up* by 0.98 points. A change that can only add error
+can't really improve accuracy, so ~1 point is the noise level of GSM8K at
+1,319 problems. FP8 weights' −0.91 points in piece 4 is the same size, which
+is why I called it indistinguishable from BF16.
+
+**7. KV room nearly doubled, not exactly.** 86,016 → 165,888 tokens is
+1.93x, not 2x. At 72 KB per token, the missing ~6k tokens are ~0.44 GB,
+likely FlashInfer's workspace buffers (not verified). `--max-model-len` didn't
+change KV room (86,016 at both 4,096 and 16,384); it only changes how many
+full-length requests fit.
+
+**8. Serving with `--max-num-seqs 1` leaves ~0.8–1.0 GB more for KV than the
+evals did.** Same weights, same 85%: 15,872 / 62,464 / 86,016 tokens in the
+piece 5 speed runs versus 10,240 / 56,320 / 79,360 in the piece 4 evals. vLLM
+sizes the KV cache after profiling a dummy batch, and a 1-sequence limit
+makes that profiled peak smaller. Phase 2 raises `--max-num-seqs` and will
+give some of this back.
+
+**9. FP8 KV is close to free, and its real payoff is capacity.** About 7%
+faster decode at long context (pending the backend control), no measurable
+quality cost, and about twice as many tokens in the same memory. That last
+part only matters once many requests share the cache (Phase 2).
 
