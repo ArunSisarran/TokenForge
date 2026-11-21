@@ -20,6 +20,7 @@ harness, and the same GPU, so rows are directly comparable.
 | 1 | vLLM, FP16, one request at a time | 16.5 | 163,507 ms | 59.9 ms | $11.77 |
 | 1 | vLLM, FP8 weights (W8A8), one request at a time | 26.3 | 102,331 ms | 37.6 ms | $7.39 |
 | 1 | vLLM, INT4 weights (GPTQ W4A16), one request at a time | 46.7 | 60,404 ms | 20.8 ms | $4.17 |
+| 1 | + EAGLE-3 speculative decoding (k=3) | 74.8 | 35,080 ms | 13.2 ms | $2.60 |
 | 2 | vLLM: continuous batching, prefix caching | | | | |
 | 6 | Kubernetes, cache-aware routing, autoscaling | | | | |
 
@@ -130,7 +131,9 @@ weights (batching, Phase 2).
 
 **9. Cost fell 3.1x for 1.9 GSM8K points** ($13.01 → $4.17 per 1M tokens with INT4). Goodput at concurrency 16 is still 1 in 32, so batching (Phase 2) is the next big lever.
 
-**10. An FP8 KV cache made long-context decode 7.2% faster** (24.55 → 22.78 ms at ~6.8k tokens, matching the 0.5 GB of KV bytes it saves) for +0.10% perplexity, and KV room went 86k → 166k tokens. Caveat: vLLM also switched the attention backend (FlashAttention → FlashInfer) for FP8 KV, so the speed number is confounded until a control run. On short chat prompts it changed nothing, as predicted.
+**10. An FP8 KV cache made long-context decode 7.2% faster** (24.55 → 22.78 ms at ~6.8k tokens, matching the 0.5 GB of KV bytes it saves) for +0.10% perplexity, and KV room went 86k → 166k tokens. vLLM also switched the attention backend for FP8 KV (FlashAttention → FlashInfer); a control run showed the backend accounts for only 0.10 ms of the 1.77 ms. On short chat prompts it changed nothing, as predicted.
+
+**11. EAGLE-3 speculative decoding made INT4 decode 1.6x faster** (mean TPOT 20.9 → 12.7 ms, $4.17 → $2.60 per 1M tokens) with 2.35 tokens accepted per target pass. Checking 4 tokens instead of 1 cost only ~0.2 ms, because decode is memory-bound; drafting took 2.9 ms per token, close to the 2.7 ms predicted from its bytes.
 
 Full write-up (in progress): [docs/phase-1-optimization.md](docs/phase-1-optimization.md)
 

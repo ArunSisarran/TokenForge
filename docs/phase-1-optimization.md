@@ -14,7 +14,7 @@ one variable at a time.
 | 4. Quality evals (perplexity, task accuracy) | ✅ done |
 | 5. Speed benchmarks: FP16 vs FP8 vs INT4 in vLLM | ✅ done |
 | 6a. FP8 KV cache | ✅ done |
-| 6b. Speculative decoding | ⬜ next |
+| 6b. Speculative decoding | 🔄 in progress |
 
 ---
 
@@ -437,7 +437,9 @@ FLASH_ATTN attention backend for every 16-bit KV run and FLASHINFER for every
 FP8 KV run. With FP8 KV the candidate list drops to `['FLASHINFER',
 'TRITON_ATTN']`, because FlashAttention can't read an FP8 KV cache on this
 GPU. So the comparison below changes both the KV precision and the attention
-kernel. A control run (16-bit KV, FlashInfer forced) is needed to separate them.
+kernel. To separate them I ran a control: 16-bit KV with FlashInfer forced,
+on long_context. FlashAttention → FlashInfer (both 16-bit) isolates the
+backend; FlashInfer 16-bit → FlashInfer FP8 isolates the KV precision.
 
 ```bash
 lm_eval --model vllm \
@@ -457,8 +459,9 @@ so the average context during decode is about 6,790 tokens.
 | --- | --- | --- | --- | --- | --- |
 | 16-bit | chat | 20.81 ms | 46.64 | 80 ms | $4.17 |
 | FP8 | chat | 20.76 ms | 46.78 | 82 ms | $4.16 |
-| 16-bit | long_context | 24.55 ms | 24.54 | 2,100 ms | $7.92 |
-| FP8 | long_context | 22.78 ms | 25.77 | 2,076 ms | $7.54 |
+| 16-bit (FlashAttention) | long_context | 24.55 ms | 24.54 | 2,100 ms | $7.92 |
+| 16-bit (FlashInfer, control) | long_context | 24.45 ms | 24.77 | 2,065 ms | $7.85 |
+| FP8 (FlashInfer) | long_context | 22.78 ms | 25.77 | 2,076 ms | $7.54 |
 
 | INT4 weights | WikiText word PPL | GSM8K strict |
 | --- | --- | --- |
@@ -474,16 +477,13 @@ KV cache room from the server logs (INT4 weights, 85% memory):
 
 ### Findings
 
-**1. The decode saving matched the bytes almost exactly, but it's
-confounded.** At 6,790 tokens of
-context the KV cache is 1.00 GB per step in 16-bit and 0.50 GB in FP8. Model
-math predicted 19.1 → 17.4 ms, a 1.7 ms saving. I measured 24.55 → 22.78 ms,
-a 1.77 ms saving (−7.2%). The saved 0.50 GB in 1.77 ms works out to ~280 GB/s,
-so the attention kernel reads the KV cache at about the same speed the matmuls
-read weights. Decode attention is memory-bound too. Because the backend also
-changed (FlashAttention → FlashInfer), part of the 1.77 ms could come from the
-kernel, in either direction. The close match to the byte prediction suggests
-the backend effect is small, but I haven't measured it.
+**1. The decode saving matched the bytes almost exactly.** At 6,790 tokens
+of context the KV cache is 1.00 GB per step in 16-bit and 0.50 GB in FP8.
+Model math predicted a 1.7 ms saving. The control splits the measured
+1.77 ms into 0.10 ms from the backend switch (24.55 → 24.45 ms) and
+**1.67 ms from the KV precision** (24.45 → 22.78 ms, −6.8%). The saved
+0.50 GB in 1.67 ms is ~300 GB/s: every byte removed from the KV cache came
+off the step at full memory speed. Decode attention is memory-bound too.
 
 **2. On short chat prompts it made no difference, as predicted.** At ~450
 tokens of context the KV cache is ~66 MB of the ~4.8 GB read per step (~1%),
@@ -495,9 +495,10 @@ long_context with a 16-bit KV cache added 3.7 ms per step for ~0.9 GB more
 KV read, about 250 GB/s. At 6.8k tokens the KV cache is already ~17% of
 the bytes per step for INT4 weights.
 
-**4. FP8 KV didn't change prefill.** TTFT went 2,100 → 2,076 ms (−1%). The
-cache is written once during prefill, and the attention math still runs in
-16-bit, so there's nothing to save. Prefill ran at ~3,200 tokens/s, about
+**4. FP8 KV didn't change prefill.** With the backend held fixed, TTFT went
+2,065 → 2,076 ms (+0.5%); the 35 ms drop in the uncontrolled comparison came
+from FlashInfer, not from FP8. The cache is written once during prefill, and
+the attention math still runs in 16-bit, so there's nothing to save. Prefill ran at ~3,200 tokens/s, about
 51 TFLOPS counting attention, or ~43% of the L4's 16-bit peak.
 
 **5. A 1-second TTFT is out of reach for 6.7k-token prompts on one L4.** The
@@ -526,8 +527,118 @@ sizes the KV cache after profiling a dummy batch, and a 1-sequence limit
 makes that profiled peak smaller. Phase 2 raises `--max-num-seqs` and will
 give some of this back.
 
-**9. FP8 KV is close to free, and its real payoff is capacity.** About 7%
-faster decode at long context (pending the backend control), no measurable
+**9. FP8 KV is close to free, and its real payoff is capacity.** 6.8%
+faster decode at long context from the KV precision alone, no measurable
 quality cost, and about twice as many tokens in the same memory. That last
 part only matters once many requests share the cache (Phase 2).
+
+---
+
+## Piece 6b: Speculative decoding
+
+At one request at a time, a decode step reads all the weights to produce one
+token. Checking several tokens in one forward pass reads the same weights
+once, so it costs almost the same. Speculative decoding uses a cheap
+**drafter** to guess the next *k* tokens. The target model then checks all
+of them in one pass and keeps the longest correct prefix, plus one token of
+its own. With greedy decoding the output is the same as normal decoding; only
+the speed changes.
+
+```
+TPOT ≈ (T_target + T_verify_extra + k × T_draft) / L
+L = mean acceptance length = tokens emitted per target pass (1 … k+1)
+```
+
+Drafters, both with k = 3 and INT4 target weights, each compared against the
+piece 5 INT4 run (the only change is `--speculative-config`):
+
+- **EAGLE-3** ([RedHatAI/Qwen3-8B-speculator.eagle3](https://huggingface.co/RedHatAI/Qwen3-8B-speculator.eagle3)):
+  one extra decoder layer that predicts from the target's own hidden states,
+  with a 32k-token draft vocabulary, in BF16. It was trained on BF16 Qwen3-8B
+  with thinking off. Predicted cost: ~0.8 GB read per draft token, ~2.7 ms.
+- **n-gram** (prompt lookup): proposes the tokens that followed the last
+  2–4 tokens wherever they appeared earlier in the prompt or output. It runs on
+  the CPU, so drafting is close to free.
+
+```bash
+--speculative-config '{"method":"eagle3","model":"RedHatAI/Qwen3-8B-speculator.eagle3","num_speculative_tokens":3}'
+--speculative-config '{"method":"ngram","num_speculative_tokens":3,"prompt_lookup_max":4,"prompt_lookup_min":2}'
+```
+
+Acceptance comes from vLLM's Prometheus counters (`/metrics`) read after each
+run, so it covers all three concurrency levels plus the 2 warmup requests.
+
+**Caveat:** the chat workload is synthetic (sentences drawn from a small
+pool), and `ignore_eos` makes the model keep generating past its natural
+end. The acceptance rates here are comparable between drafters on this
+workload, not representative of real chat traffic.
+
+### Results (INT4 weights, concurrency 1)
+
+| Drafter | L | Draft tokens accepted | TPOT p50 | TPOT mean | Out tok/s | TTFT p50 | $ / 1M tokens |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| None (piece 5) | 1 | | 20.81 ms | 20.88 ms | 46.64 | 80 ms | $4.17 |
+| n-gram, k=3 | 1.27 | 9.1% | 17.88 ms | 16.57 ms | 58.22 (1.25x) | 85 ms | $3.34 |
+| EAGLE-3, k=3 | 2.35 | 45.1% | 13.15 ms | 12.69 ms | 74.80 (1.60x) | 91 ms | $2.60 |
+
+TPOT mean = total decode time ÷ total tokens after the first, the average
+that throughput depends on.
+
+Acceptance by draft position (share of all drafts where that position was
+accepted; a position only counts if every earlier one was also accepted):
+
+| Drafter | 1st | 2nd | 3rd | 2nd given 1st | 3rd given 2nd |
+| --- | --- | --- | --- | --- | --- |
+| n-gram | 11.7% | 8.7% | 6.8% | 75% | 77% |
+| EAGLE-3 | 65.7% | 43.1% | 26.5% | 66% | 61% |
+
+KV cache room: 86,016 tokens without a drafter, 85,504 with n-gram,
+68,608 with EAGLE-3.
+
+### Findings
+
+**1. EAGLE-3 made decode 1.6x faster, and the formula predicted it.** Mean
+TPOT fell from 20.88 to 12.69 ms. Each speculative step took 29.9 ms
+(12.69 × 2.35) and produced 2.35 tokens on average. Plugging the measured
+L into my prediction: (20.9 + 3 × 2.7) ÷ 2.35 ≈ 12.3 ms, within 3% of the
+measurement. Cost per 1M tokens fell from $4.17 to $2.60.
+
+**2. Checking extra tokens is almost free; drafting them isn't.** The n-gram
+drafter costs nothing on the GPU, so its step time shows the cost of checking
+4 tokens instead of 1. That came to 21.1 ms vs 20.9 ms, only ~0.2 ms more.
+Decode is memory-bound, so the extra math hides behind the weight reads. That
+leaves 29.9 − 21.1 = 8.8 ms for EAGLE-3's three draft passes, 2.9 ms each,
+against the 2.7 ms I predicted from bytes. So 29% of each speculative step
+goes to drafting.
+
+**3. k = 3 is about right for this target.** The 4th draft token would
+cost ~2.9 ms. To pay for itself it would need to be accepted on more than
+~23% of drafts. Position 3 was accepted 26.5% of the time, and each position
+keeps ~61–66% of the previous one, so position 4 would land near 16%. k=4
+would be slightly slower. Using the measured positions, k=2 would give
+~12.9 ms, about the same as k=3. (k=4 is extrapolated, not measured.)
+
+**4. EAGLE-3 reached its published acceptance even on synthetic text and an
+INT4 target.** L = 2.35 at k = 3 sits inside the 2.13–2.48 Red Hat reports
+on real tasks (with a BF16 target and sampling at temperature 0.6). Greedy
+decoding helps acceptance, and the INT4 hidden states didn't visibly hurt
+it. Without an FP16 run on the same workload, I can't measure any INT4
+penalty directly.
+
+**5. n-gram drafting is all-or-nothing.** Its first guess was right only
+11.7% of the time, but once one guess was right the next ones were ~75%
+right. It wins in bursts where the model copies text it has already seen, and
+the synthetic prompts (repeated sentences from a small pool) give it a few
+such bursts. TPOT per request ranged from 9.6 to 20.7 ms. It gave 1.25x
+throughput at no memory cost, but this workload flatters it. Real
+chat copies less, while summarization and code editing copy more.
+
+**6. EAGLE-3 costs memory and a little TTFT.** KV room fell from 86,016 to
+68,608 tokens. That's ~2.4 GB, consistent with the whole 2.04 GB draft
+checkpoint (including its own copy of the 1.24 GB embedding table) plus a 37th
+layer of KV cache. TTFT rose ~10 ms because the drafter also has to process
+the prompt.
+
+**7. The FP16 + EAGLE-3 run didn't start.** At 85% memory, FP16 had only
+15,872 tokens (~2.2 GB) of KV room, less than the ~2.4 GB EAGLE-3 takes.
 
