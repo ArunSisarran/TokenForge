@@ -221,6 +221,8 @@ async def main():
     p.add_argument("--model", default=None, help="model name to send (vLLM requires it)")
     p.add_argument("--concurrency", type=int, nargs="+", default=[1, 4, 16])
     p.add_argument("--num-requests", type=int, default=32, help="requests per level")
+    p.add_argument("--min-rounds", type=int, default=1,
+                   help="send at least this many requests per user at each level")
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--ignore-eos", action="store_true",
                    help="force every request to generate exactly max_tokens")
@@ -243,7 +245,7 @@ async def main():
             it["max_tokens"] = min(it["max_tokens"], args.max_tokens_cap)
 
     random.Random(args.seed).shuffle(items)
-    if len(items) < args.num_requests:
+    if len(items) < max(args.num_requests, args.min_rounds * max(args.concurrency)):
         print(f"note: workload has only {len(items)} requests")
 
     print(f"Benchmarking {endpoint} with {Path(args.workload).name}, label={args.label}")
@@ -252,7 +254,7 @@ async def main():
 
     summaries, raw = [], {}
     for c in args.concurrency:
-        level_items = items[: args.num_requests]
+        level_items = items[: max(args.num_requests, args.min_rounds * c)]
         print(f"  concurrency={c}: {len(level_items)} requests ...", flush=True)
         results, wall_s = await run_level(endpoint, args.model, level_items, c,
                                           args.ignore_eos, args.timeout)
