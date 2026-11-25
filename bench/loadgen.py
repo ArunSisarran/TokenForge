@@ -39,6 +39,7 @@ async def send_one(client: httpx.AsyncClient, url: str, model: str | None,
         body["model"] = model
     if ignore_eos:
         body["ignore_eos"] = True
+    body.update(item.get("extra_body", {}))
 
     record = {"id": item["id"], "ok": False, "error": None,
               "ttft_s": None, "e2e_s": None, "tpot_s": None,
@@ -236,12 +237,15 @@ async def main():
     p.add_argument("--label", default="run", help="name for this run, e.g. baseline-hf-fp16")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out-dir", default="bench/results")
+    p.add_argument("--extra-body", type=json.loads, default={},
+                   help="JSON object merged into every request body")
     args = p.parse_args()
 
     endpoint = args.url.rstrip("/") + "/v1/chat/completions"
     items = [json.loads(line) for line in Path(args.workload).read_text().splitlines() if line.strip()]
-    if args.max_tokens_cap:
-        for it in items:
+    for it in items:
+        it["extra_body"] = args.extra_body
+        if args.max_tokens_cap:
             it["max_tokens"] = min(it["max_tokens"], args.max_tokens_cap)
 
     random.Random(args.seed).shuffle(items)
