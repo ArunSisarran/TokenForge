@@ -5,7 +5,7 @@ from a deliberately naive baseline to an optimized, autoscaled Kubernetes
 deployment. Every layer is benchmarked against the one before it, so each
 optimization comes with a measured before/after number.
 
-**Model:** Qwen3-8B  **Hardware:** NVIDIA L4 (24 GB)  **Status:** Phase 0 complete, Phase 1 in progress
+**Model:** Qwen3-8B  **Hardware:** NVIDIA L4 (24 GB)  **Status:** Phases 0–1 complete, Phase 2 next
 
 ---
 
@@ -70,7 +70,7 @@ Full write-up: [docs/phase-0-baseline.md](docs/phase-0-baseline.md)
 
 ---
 
-## Phase 1 findings (in progress)
+## Phase 1 findings: model-level optimization
 
 Before optimizing, `optimize/model_math.py` predicts memory use and decode
 ceilings from the model config, and `optimize/profile_request.py` runs
@@ -135,21 +135,21 @@ weights (batching, Phase 2).
 
 **11. EAGLE-3 speculative decoding made INT4 decode 1.6x faster** (mean TPOT 20.9 → 12.7 ms, $4.17 → $2.60 per 1M tokens) with 2.35 tokens accepted per target pass. Checking 4 tokens instead of 1 cost only ~0.2 ms, because decode is memory-bound; drafting took 2.9 ms per token, close to the 2.7 ms predicted from its bytes.
 
-Full write-up (in progress): [docs/phase-1-optimization.md](docs/phase-1-optimization.md)
+Full write-up: [docs/phase-1-optimization.md](docs/phase-1-optimization.md)
 
 ---
 
 ## Roadmap
 
 - [x] **Phase 0: Baseline.** Naive HF server and benchmark harness
-- [ ] **Phase 1: Model optimization.**
+- [x] **Phase 1: Model optimization.**
     - [x] Model math: memory, KV cache, and decode ceilings per precision
     - [x] Profiling: prefill vs decode, kernel breakdown
     - [x] FP8 and INT4 quantization
     - [x] Quality evals (perplexity, task accuracy)
     - [x] Speed benchmarks: FP16 vs FP8 vs INT4
     - [x] FP8 KV cache
-    - [ ] Speculative decoding
+    - [x] Speculative decoding
 - [ ] **Phase 2: Inference engine.** vLLM tuning (continuous batching, prefix caching, chunked prefill), comparison with SGLang
 - [ ] **Phase 3: Gateway.** API keys, per-key rate limiting (Redis), streaming proxy
 - [ ] **Phase 4: Containers.** Multi-stage Docker images, docker-compose stack

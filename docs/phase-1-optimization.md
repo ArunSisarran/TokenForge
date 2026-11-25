@@ -1,10 +1,29 @@
-# Phase 1: Model-level optimization (in progress)
+# Phase 1: Model-level optimization
 
 **Goal:** make each token cheaper at the model level (quantization, KV cache,
 speculative decoding) and be able to explain *why* each change helps.
 
 **Approach:** predict from first principles before measuring, then change
 one variable at a time.
+
+**Summary** (Qwen3-8B on one L4, chat workload, one request at a time):
+
+| Step | TPOT | Out tok/s | $ / 1M tokens | Quality cost |
+| --- | --- | --- | --- | --- |
+| HF FP16 baseline (Phase 0) | 65.6 ms | 14.95 | $13.01 | |
+| vLLM FP16 (engine only) | 59.9 ms | 16.53 | $11.77 | |
+| vLLM FP8 weights | 37.6 ms | 26.31 | $7.39 | GSM8K −0.9 pts (noise), PPL +1.0% |
+| vLLM INT4 weights | 20.8 ms | 46.64 | $4.17 | GSM8K −1.9 pts, PPL +3.9% |
+| INT4 + EAGLE-3 speculative decoding | 13.2 ms | 74.80 | $2.60 | none expected (greedy) |
+
+FP8 KV cache: no change on chat, −6.8% TPOT at 6.8k-token context, and 1.93x
+KV room.
+
+Overall: 5.0x throughput and 5.0x lower cost per token than the baseline,
+for about 2 GSM8K points. Every step except the engine swap removed bytes
+read per token, and each one landed close to its byte-count prediction.
+Concurrency still adds nothing, because every run here served one request at a
+time. That's Phase 2.
 
 | Piece | Status |
 | --- | --- |
@@ -14,7 +33,7 @@ one variable at a time.
 | 4. Quality evals (perplexity, task accuracy) | ✅ done |
 | 5. Speed benchmarks: FP16 vs FP8 vs INT4 in vLLM | ✅ done |
 | 6a. FP8 KV cache | ✅ done |
-| 6b. Speculative decoding | 🔄 in progress |
+| 6b. Speculative decoding | ✅ done |
 
 ---
 
@@ -639,6 +658,9 @@ checkpoint (including its own copy of the 1.24 GB embedding table) plus a 37th
 layer of KV cache. TTFT rose ~10 ms because the drafter also has to process
 the prompt.
 
-**7. The FP16 + EAGLE-3 run didn't start.** At 85% memory, FP16 had only
-15,872 tokens (~2.2 GB) of KV room, less than the ~2.4 GB EAGLE-3 takes.
+**7. The FP16 + EAGLE-3 run didn't start, and I didn't retry it.** At 85%
+memory, FP16 had only 15,872 tokens (~2.2 GB) of KV room, less than the
+~2.4 GB EAGLE-3 takes. A retry at 90% would test a prediction I'm leaving
+open: the same ~8.8 ms of drafting is ~13% of a 60 ms FP16 step instead of
+29% of an INT4 step, so FP16 should gain more (~2x if L stays ~2.35).
 
