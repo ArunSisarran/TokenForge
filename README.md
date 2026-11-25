@@ -5,7 +5,7 @@ from a deliberately naive baseline to an optimized, autoscaled Kubernetes
 deployment. Every layer is benchmarked against the one before it, so each
 optimization comes with a measured before/after number.
 
-**Model:** Qwen3-8B  **Hardware:** NVIDIA L4 (24 GB)  **Status:** Phases 0–1 complete, Phase 2 next
+**Model:** Qwen3-8B  **Hardware:** NVIDIA L4 (24 GB)  **Status:** Phases 0–2 complete, Phase 3 next
 
 ---
 
@@ -14,17 +14,25 @@ optimization comes with a measured before/after number.
 All runs use the same fixed workload (`bench/workloads/chat.jsonl`), the same
 harness, and the same GPU, so rows are directly comparable.
 
-| Phase | Configuration | Out tok/s @ c=16 | TTFT p95 @ c=16 | TPOT p50 @ c=1 | $ / 1M output tokens |
+| Phase | Configuration | Out tok/s @ c=16 | TTFT p95 @ c=16 | TPOT p50 @ c=1 | $ / 1M output tokens @ c=16 |
 | --- | --- | --- | --- | --- | --- |
 | 0 | Hugging Face `transformers`, FP16, one request at a time | 14.9 | 172,658 ms | 65.6 ms | $13.01 |
 | 1 | vLLM, FP16, one request at a time | 16.5 | 163,507 ms | 59.9 ms | $11.77 |
 | 1 | vLLM, FP8 weights (W8A8), one request at a time | 26.3 | 102,331 ms | 37.6 ms | $7.39 |
 | 1 | vLLM, INT4 weights (GPTQ W4A16), one request at a time | 46.7 | 60,404 ms | 20.8 ms | $4.17 |
 | 1 | + EAGLE-3 speculative decoding (k=3) | 74.8 | 35,080 ms | 13.2 ms | $2.60 |
-| 2 | vLLM: continuous batching, prefix caching | | | | |
+| 2 | vLLM INT4, continuous batching | 432.6 | 1,395 ms | 20.8 ms | $0.45 |
+| 2 | + FP8 KV cache | 454.5 | 1,504 ms | 20.8 ms | $0.43 |
+| 2 | INT4 + EAGLE-3 (k=3), batching | 541.0 | 1,585 ms | 13.1 ms | $0.36 |
+| 2 | SGLang 0.5.23, INT4, batching | 420.9 | 1,749 ms | 20.2 ms | $0.46 |
 | 6 | Kubernetes, cache-aware routing, autoscaling | | | | |
 
 *c = concurrent requests. TTFT = time to first token. TPOT = time per output token.*
+
+Phase 0–1 rows serve one request at a time, so their cost is the same at
+every concurrency. At c=64, vLLM INT4 + FP8 KV cache reaches **954 tok/s at
+$0.20 per 1M tokens** (64x the baseline), while EAGLE-3 falls behind plain
+decoding (780 vs 839 tok/s).
 
 ![Latency vs throughput](bench/results/latency_vs_throughput.png)
 
@@ -139,6 +147,37 @@ Full write-up: [docs/phase-1-optimization.md](docs/phase-1-optimization.md)
 
 ---
 
+## Phase 2 findings: engine tuning under load
+
+Phase 1 served one request at a time. Phase 2 lets vLLM batch requests,
+sweeps concurrency from 1 to 64, and changes one engine flag per run.
+
+![Phase 2 batching](bench/results/phase2-batching.png)
+
+**1. Batching gave 18x throughput for 3.3x TPOT.** INT4 went from 46.7 to 839 tok/s between c=1 and c=64 (TPOT 20.8 → 69.6 ms): $0.23 per 1M tokens, 56x cheaper than the baseline. One read of the weights now serves up to 64 sequences.
+
+**2. At c=64 the GPU becomes compute-bound.** It does ~35 TFLOP/s of useful math (4.64 requests/s × 462 tokens × 16.4 GFLOP), close to the 40–43 TFLOPS the best Phase 1 prefill reached. That's why INT4's lead over FP8 shrinks from 1.76x at c=1 to 1.11x at c=64: fewer weight bytes stop helping once math is the limit.
+
+**3. FP16 runs out of KV cache:** ~15.9k tokens of room fits only ~30 sequences, so at c=64 throughput stops at 273 tok/s and TTFT p50 reaches 23.6 s.
+
+**4. `max-num-seqs` trades TTFT for TPOT, and queueing math predicts it.** Capped at 8 with 64 users, TPOT stays at 25 ms, but each request waits for 7 others ahead of it (~4.3 s each): ~30 s predicted, 32.2 s measured. With a 100 ms TPOT SLO, no cap is best.
+
+**5. `max-num-batched-tokens` only moves latency between TTFT and TPOT.** On 6.7k-token prompts, budgets of 512 / 2048 / 8192 gave the same throughput (±3%) and E2E (23.1–23.8 s): the total prefill work doesn't change. Small chunks even out TPOT across requests; big ones give faster decodes between long stalls.
+
+**6. Prefix caching gave 4.6x throughput on a shared ~1.7k-token system prompt** (175 → 800 tok/s at c=32, SLO 0% → 100%), with a 96.5% token hit rate. TTFT at c=1 fell 510 → 63 ms. TPOT under load improved 4.4x too, because prefill no longer competes with decode.
+
+**7. The FP8 KV cache helps only under load:** +0% at c=1, +13.6% at c=64 (TPOT 69.6 → 60.3 ms), against ~6.6 ms predicted from bytes. FlashInfer also changed (as in Phase 1), and I didn't run that control at batch 64.
+
+**8. EAGLE-3 wins at low load and loses at high load:** 1.61x at c=1, 1.05x at c=32, 0.93x at c=64, with acceptance unchanged (L = 2.42). Checking 4 tokens to keep 2.42 costs 1.65x the compute per token, which is free when memory-bound and expensive when compute-bound.
+
+**9. SGLang 0.5.23 matched vLLM within ±3%** on throughput and TPOT, but had a worse steady-state TTFT p95 at c=64 (1.32 s vs 0.73 s) and took ~10 minutes to start (480 s of CUDA graph capture) vs ~2 for vLLM.
+
+**10. Most SLO misses at c=64 came from the benchmark's start-up burst.** Closed-loop load starts each level with all c users at once. For INT4 at c=64, all 57 requests over 1 s TTFT were in that first wave; after it, 189/192 met the SLO.
+
+Full write-up: [docs/phase-2-engine.md](docs/phase-2-engine.md)
+
+---
+
 ## Roadmap
 
 - [x] **Phase 0: Baseline.** Naive HF server and benchmark harness
@@ -150,7 +189,12 @@ Full write-up: [docs/phase-1-optimization.md](docs/phase-1-optimization.md)
     - [x] Speed benchmarks: FP16 vs FP8 vs INT4
     - [x] FP8 KV cache
     - [x] Speculative decoding
-- [ ] **Phase 2: Inference engine.** vLLM tuning (continuous batching, prefix caching, chunked prefill), comparison with SGLang
+- [x] **Phase 2: Inference engine.**
+    - [x] Continuous batching: FP16 vs FP8 vs INT4, c=1 to 64
+    - [x] Scheduler limits: `max-num-seqs`, `max-num-batched-tokens`
+    - [x] Prefix caching
+    - [x] FP8 KV cache and speculative decoding under load
+    - [x] SGLang comparison
 - [ ] **Phase 3: Gateway.** API keys, per-key rate limiting (Redis), streaming proxy
 - [ ] **Phase 4: Containers.** Multi-stage Docker images, docker-compose stack
 - [ ] **Phase 5: Kubernetes.** Helm chart, GPU scheduling, probes, rolling updates
@@ -169,6 +213,7 @@ TokenForge/
 │   ├── make_workloads.py   # generates the fixed, seeded workloads
 │   ├── loadgen.py          # async load generator: TTFT, TPOT, goodput, $/1M tokens
 │   ├── plot.py             # latency vs throughput chart
+│   ├── phase2.sh           # Phase 2 engine experiments, run back to back on the GPU
 │   ├── workloads/          # committed once, never edited
 │   └── results/            # one JSON per run, with full metadata
 ├── optimize/
@@ -228,7 +273,10 @@ python bench/plot.py bench/results/*.json
 
 **Load.** Closed-loop: *c* virtual users, each sending its next request as
 soon as the previous one finishes. Each concurrency level sends the same 32
-requests (shuffled with a fixed seed) after 2 warmup requests.
+requests (shuffled with a fixed seed) after 2 warmup requests. From Phase 2
+on, `--min-rounds 4` sends at least 4 requests per user, so high-concurrency
+levels reach steady state. All users start together, so the first wave of
+each level is a burst; Phase 2 reports SLO attainment with and without it.
 
 **Settings for all reported runs.** `temperature=0`, `ignore_eos=true`
 (every request generates exactly its `max_tokens`), `max_tokens` capped at
@@ -249,6 +297,7 @@ Latencies are reported as percentiles (p50, p95, p99), not averages.
 **Environment for reported results.** NVIDIA L4 (23 GB usable), driver
 595.91.07 (Phase 0) and 595.112.07 (Phase 1), RunPod at $0.70/hour, Python
 3.12, server and load generator on the same machine (no network latency
-included). vLLM runs use vLLM 0.34.0 with prefix caching off and Qwen3's
-thinking mode off, to match the baseline. Every result file in
+included). vLLM runs use vLLM 0.34.0 with prefix caching off (except the
+Phase 2 prefix caching runs) and Qwen3's thinking mode off, to match the
+baseline. SGLang runs use SGLang 0.5.23 with its radix cache off. Every result file in
 `bench/results/` records its full configuration, git commit and hardware.
