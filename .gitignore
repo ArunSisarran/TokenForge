@@ -3,3 +3,5 @@ optimize/traces/
 context/
 CLAUDE.md
 optimize/evals/*.log
+phase2-logs/
+__pycache__/
