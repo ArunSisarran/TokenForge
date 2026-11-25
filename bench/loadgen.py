@@ -89,14 +89,14 @@ async def send_one(client: httpx.AsyncClient, url: str, model: str | None,
     return record
 
 
-async def run_level(url, model, items, concurrency, ignore_eos, timeout_s):
+async def run_level(url, model, items, concurrency, ignore_eos, timeout_s, headers=None):
     """Closed-loop load: `concurrency` users, each sending its next request when the last ends."""
     queue = iter(items)
     results = []
 
     limits = httpx.Limits(max_connections=concurrency, max_keepalive_connections=concurrency)
     timeout = httpx.Timeout(timeout_s, connect=10.0)
-    async with httpx.AsyncClient(limits=limits, timeout=timeout) as client:
+    async with httpx.AsyncClient(limits=limits, timeout=timeout, headers=headers) as client:
 
         async def virtual_user():
             for item in queue:  # all users share one iterator
@@ -109,11 +109,11 @@ async def run_level(url, model, items, concurrency, ignore_eos, timeout_s):
     return results, wall_s
 
 
-async def warmup(url, model, items, ignore_eos, timeout_s, n):
+async def warmup(url, model, items, ignore_eos, timeout_s, n, headers=None):
     """Send n requests and discard their timings."""
     if n <= 0:
         return
-    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_s, connect=10.0)) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_s, connect=10.0), headers=headers) as client:
         for item in items[:n]:
             await send_one(client, url, model, item, ignore_eos)
 
@@ -175,7 +175,7 @@ def gather_metadata(args):
     """Record args, server health, git commit and GPU so results stay explainable."""
     meta = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "args": vars(args),
+        "args": {**vars(args), "api_key": "<redacted>" if args.api_key else None},
         "client_host": socket.gethostname(),
         "python": platform.python_version(),
     }
@@ -239,7 +239,9 @@ async def main():
     p.add_argument("--out-dir", default="bench/results")
     p.add_argument("--extra-body", type=json.loads, default={},
                    help="JSON object merged into every request body")
+    p.add_argument("--api-key", default=None, help="sent as 'Authorization: Bearer <key>' (gateway)")
     args = p.parse_args()
+    headers = {"Authorization": f"Bearer {args.api_key}"} if args.api_key else None
 
     endpoint = args.url.rstrip("/") + "/v1/chat/completions"
     items = [json.loads(line) for line in Path(args.workload).read_text().splitlines() if line.strip()]
@@ -254,14 +256,14 @@ async def main():
 
     print(f"Benchmarking {endpoint} with {Path(args.workload).name}, label={args.label}")
     meta = gather_metadata(args)
-    await warmup(endpoint, args.model, items, args.ignore_eos, args.timeout, args.warmup)
+    await warmup(endpoint, args.model, items, args.ignore_eos, args.timeout, args.warmup, headers)
 
     summaries, raw = [], {}
     for c in args.concurrency:
         level_items = items[: max(args.num_requests, args.min_rounds * c)]
         print(f"  concurrency={c}: {len(level_items)} requests ...", flush=True)
         results, wall_s = await run_level(endpoint, args.model, level_items, c,
-                                          args.ignore_eos, args.timeout)
+                                          args.ignore_eos, args.timeout, headers)
         s = summarize(results, wall_s, c, args)
         summaries.append(s)
         raw[str(c)] = results

@@ -8,6 +8,9 @@ fastapi>=0.110
 uvicorn[standard]>=0.29
 pydantic>=2.6
 httpx>=0.27        # async HTTP client with streaming support
+redis>=5           # gateway: API keys and rate limits
 matplotlib>=3.8    # plots
 vllm==0.34.0; sys_platform == "linux"  # pinned for the whole project; needs torch==2.14.0
 lm-eval>=0.4.13      # quality evals (perplexity, GSM8K)
+pytest>=8           # gateway tests
+fakeredis[lua]>=2.26 # in-process Redis with Lua, so tests need no server

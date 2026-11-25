@@ -5,3 +5,4 @@ CLAUDE.md
 optimize/evals/*.log
 phase2-logs/
 __pycache__/
+.pytest_cache/
