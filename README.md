@@ -5,7 +5,7 @@ from a deliberately naive baseline to an optimized, autoscaled Kubernetes
 deployment. Every layer is benchmarked against the one before it, so each
 optimization comes with a measured before/after number.
 
-**Model:** Qwen3-8B  **Hardware:** NVIDIA L4 (24 GB)  **Status:** Phases 0–2 complete, Phase 3 next
+**Model:** Qwen3-8B  **Hardware:** NVIDIA L4 (24 GB)  **Status:** Phases 0–3 complete, Phase 4 next
 
 ---
 
@@ -178,6 +178,27 @@ Full write-up: [docs/phase-2-engine.md](docs/phase-2-engine.md)
 
 ---
 
+## Phase 3 findings: the gateway
+
+A FastAPI gateway in front of the engine: hashed API keys, per-key limits on
+requests and output tokens per minute (two token buckets, charged together by
+one atomic Lua script in Redis), input checks, and streaming passthrough that
+frees the engine's batch slot when a client disconnects. I measured its
+overhead on a laptop against a fake engine with fixed timings (TTFT 80 ms,
+TPOT 21 ms), running the same load directly and through the gateway.
+
+**1. The gateway adds ~2.5 ms of TTFT** (+2.4 ms at c=1, +3.1 ms at c=64), under 3% of vLLM's real TTFT on the L4.
+
+**2. TPOT doesn't change** (within 0.05 ms at every level): once admitted, a request's chunks are only forwarded.
+
+**3. At c=256 one gateway process strains, and it shows in TTFT:** steady-state TTFT p95 522 ms vs 102 ms direct, throughput −7.8%. New requests wait on the event loop behind ~7,400 chunks/s of forwarding.
+
+**4. One gateway process has ~8x the headroom of one L4:** it forwarded 7,385 tok/s, against the 954 tok/s of the fastest Phase 2 config. At this scale, Python is fast enough.
+
+Full write-up: [docs/phase-3-gateway.md](docs/phase-3-gateway.md)
+
+---
+
 ## Roadmap
 
 - [x] **Phase 0: Baseline.** Naive HF server and benchmark harness
@@ -195,7 +216,7 @@ Full write-up: [docs/phase-2-engine.md](docs/phase-2-engine.md)
     - [x] Prefix caching
     - [x] FP8 KV cache and speculative decoding under load
     - [x] SGLang comparison
-- [ ] **Phase 3: Gateway.** API keys, per-key rate limiting (Redis), streaming proxy
+- [x] **Phase 3: Gateway.** API keys, per-key rate limiting (Redis), streaming proxy, overhead benchmark
 - [ ] **Phase 4: Containers.** Multi-stage Docker images, docker-compose stack
 - [ ] **Phase 5: Kubernetes.** Helm chart, GPU scheduling, probes, rolling updates
 - [ ] **Phase 6: Routing and autoscaling.** KV-cache-aware routing, KEDA autoscaling on queue depth
@@ -216,6 +237,11 @@ TokenForge/
 │   ├── phase2.sh           # Phase 2 engine experiments, run back to back on the GPU
 │   ├── workloads/          # committed once, never edited
 │   └── results/            # one JSON per run, with full metadata
+├── gateway/
+│   ├── app.py              # API keys, Redis rate limits, streaming passthrough
+│   ├── keys.py             # create / list / revoke API keys
+│   ├── fake_upstream.py    # fake engine with fixed timings (no GPU needed)
+│   └── test_gateway.py     # in-process tests (fakeredis + fake engine)
 ├── optimize/
 │   ├── model_math.py       # predicts memory, KV cache size, decode ceilings
 │   └── profile_request.py  # profiles prefill and decode, exports a GPU trace
