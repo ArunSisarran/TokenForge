@@ -5,6 +5,7 @@ in front of an OpenAI-compatible engine (vLLM or SGLang).
 Run (Redis and the engine must already be up):
     UPSTREAM_URL=http://localhost:8000 REDIS_URL=redis://localhost:6379 \
         uvicorn gateway.app:app --port 8080
+Set UPSTREAM_API_KEY when the engine requires one (vllm serve --api-key).
 """
 
 import hashlib
@@ -62,17 +63,24 @@ def key_hash(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Open one Redis client and one pooled upstream HTTP client for the process."""
-    app.state.redis = redis.Redis.from_url(REDIS_URL, decode_responses=True)
-    app.state.http = httpx.AsyncClient(
-        base_url=UPSTREAM_URL,
+def engine_client(transport: httpx.AsyncBaseTransport | None = None) -> httpx.AsyncClient:
+    """Pooled HTTP client for the engine, sending UPSTREAM_API_KEY if one is set."""
+    key = os.environ.get("UPSTREAM_API_KEY")
+    return httpx.AsyncClient(
+        base_url=UPSTREAM_URL, transport=transport,
+        headers={"Authorization": f"Bearer {key}"} if key else None,
         # No total timeout: a stream can legitimately run for minutes.
         timeout=httpx.Timeout(connect=5.0, read=120.0, write=10.0, pool=10.0),
         # httpx's default cap of 100 connections would silently queue user 101.
         limits=httpx.Limits(max_connections=1000, max_keepalive_connections=1000),
     )
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Open one Redis client and one pooled engine client for the process."""
+    app.state.redis = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+    app.state.http = engine_client()
     yield
     await app.state.http.aclose()
     await app.state.redis.aclose()

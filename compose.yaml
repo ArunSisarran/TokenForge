@@ -1,0 +1,53 @@
+# TokenForge stack: gateway + Redis in front of an OpenAI-compatible engine.
+#
+# Laptop, no GPU (fake engine on :8000, gateway on :8080):
+#     docker compose --profile fake up -d --build --wait
+#     docker compose --profile fake down    # without --profile, the engine keeps running
+# Real vLLM elsewhere, e.g. a RunPod pod with its port exposed over TCP:
+#     UPSTREAM_URL=http://<ip>:<port> UPSTREAM_API_KEY=<secret> docker compose up -d --build --wait
+# Create a key:
+#     docker compose exec gateway python -m gateway.keys create alice --rpm 60 --tpm 20000
+
+services:
+  gateway:
+    build: {context: gateway, target: gateway}
+    image: tokenforge-gateway
+    environment:
+      UPSTREAM_URL: ${UPSTREAM_URL:-http://engine:8000}
+      UPSTREAM_API_KEY: ${UPSTREAM_API_KEY:-}
+      REDIS_URL: redis://redis:6379
+    # 127.0.0.1 only: Docker otherwise publishes ports to every network the laptop is on.
+    ports: ["127.0.0.1:8080:8080"]
+    depends_on:
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:8.12.0-alpine
+    volumes: ["redis-data:/data"]  # keys survive `docker compose down` (not `down -v`)
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  engine:
+    profiles: [fake]
+    build: {context: gateway, target: fake}
+    image: tokenforge-fake-engine
+    environment: {TTFT_MS: 80, TPOT_MS: 21}
+    ports: ["127.0.0.1:8000:8000"]  # published so loadgen can also hit it directly
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  redis-data:

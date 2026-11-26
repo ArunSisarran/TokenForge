@@ -86,6 +86,26 @@ def test_denied_request_charges_no_bucket():
     asyncio.run(t())
 
 
+def test_engine_key_replaces_client_key(monkeypatch):
+    seen = []
+
+    def engine(request):
+        seen.append(request.headers.get("authorization"))
+        return httpx.Response(200, text="data: [DONE]\n\n")
+
+    async def t():
+        c = await gateway()
+        monkeypatch.setenv("UPSTREAM_API_KEY", "engine-secret")
+        gw.app.state.http = gw.engine_client(httpx.MockTransport(engine))
+        assert (await c.post(URL, json=CHAT)).status_code == 200
+        monkeypatch.delenv("UPSTREAM_API_KEY")
+        gw.app.state.http = gw.engine_client(httpx.MockTransport(engine))
+        await c.post(URL, json=CHAT)
+        # The client's gateway key must never reach the engine.
+        assert seen == ["Bearer engine-secret", None]
+    asyncio.run(t())
+
+
 def test_engine_down():
     async def t():
         c = await gateway(engine=httpx.MockTransport(down))
