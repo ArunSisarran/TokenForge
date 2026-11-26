@@ -4,16 +4,20 @@
 #     docker build --target gateway -t tokenforge-gateway gateway/
 #     docker build --target fake -t tokenforge-fake-engine gateway/
 
-# Stage 1: install dependencies into a virtualenv. Only /opt/venv leaves this stage,
-# so pip and its caches never reach the final image.
-FROM python:3.14.10-slim-trixie AS build
-RUN python -m venv /opt/venv
+# Stage 1: install dependencies into a virtualenv that has no pip of its own.
+# Only /opt/venv leaves this stage.
+# The digest pins the exact build: the official image is rebuilt under the same tag.
+FROM python:3.14.10-slim-trixie@sha256:22eafb370920ad8b429e0aec3fff433e0669968519f5d60469d83729c138b28b AS build
+RUN python -m venv --without-pip /opt/venv
 COPY requirements.txt /tmp/requirements.txt
-RUN /opt/venv/bin/pip install --no-cache-dir --disable-pip-version-check -r /tmp/requirements.txt
+RUN pip --python /opt/venv/bin/python install --no-cache-dir --disable-pip-version-check \
+    --root-user-action=ignore -r /tmp/requirements.txt
 
 # Stage 2: the runtime image.
-FROM python:3.14.10-slim-trixie AS gateway
+FROM python:3.14.10-slim-trixie@sha256:22eafb370920ad8b429e0aec3fff433e0669968519f5d60469d83729c138b28b AS gateway
 COPY --from=build /opt/venv /opt/venv
+# pip isn't needed at runtime, and its bundled copies of urllib3, msgpack and setuptools carry CVEs.
+RUN python -m pip uninstall -y --root-user-action=ignore pip
 ENV PATH=/opt/venv/bin:$PATH PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app
 COPY __init__.py app.py keys.py gateway/
