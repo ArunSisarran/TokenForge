@@ -5,7 +5,7 @@ from a deliberately naive baseline to an optimized, autoscaled Kubernetes
 deployment. Every layer is benchmarked against the one before it, so each
 optimization comes with a measured before/after number.
 
-**Model:** Qwen3-8B  **Hardware:** NVIDIA L4 (24 GB)  **Status:** Phases 0–3 complete, Phase 4 next
+**Model:** Qwen3-8B  **Hardware:** NVIDIA L4 (24 GB)  **Status:** Phases 0–4 complete, Phase 5 next
 
 ---
 
@@ -199,6 +199,25 @@ Full write-up: [docs/phase-3-gateway.md](docs/phase-3-gateway.md)
 
 ---
 
+## Phase 4 findings: containers
+
+The gateway ships as a two-stage, non-root image with every dependency pinned
+(base image by digest). `docker compose up` starts gateway + Redis, and the
+engine is the official `vllm/vllm-openai` image, unmodified, with weights on
+a volume. I ran the compose stack on my laptop against vLLM on a RunPod L4.
+
+**1. Containerized, the stack serves exactly as fast as the hand-run setup:** 967 tok/s at c=64 vs 954 in Phase 2, and TPOT at c=1 within 0.05 ms (20.79 vs 20.78 ms).
+
+**2. My dependencies added zero known vulnerabilities.** The gateway image's 225 Trivy findings all come from the Debian base. The 8 Python findings were all in pip's bundled libraries, so I removed pip from the runtime image (8 → 0).
+
+**3. The vLLM image has 12x the findings (2,650, 18 critical), but 51% of them and every critical are kernel headers (`linux-libc-dev`)** that a container never runs. The image's size (CUDA, ffmpeg, ~300 Python packages) drives the count.
+
+**4. Going over the internet raised TTFT, not TPOT:** c=1 TTFT p50 rose from 80 ms to 154–236 ms, while TPOT stayed at 20.8 ms. The gateway's ~2.5 ms (Phase 3) disappears into that jitter: the gateway run was even faster than the direct run, which can only be the network varying between runs.
+
+Full write-up: [docs/phase-4-docker.md](docs/phase-4-docker.md)
+
+---
+
 ## Roadmap
 
 - [x] **Phase 0: Baseline.** Naive HF server and benchmark harness
@@ -217,7 +236,7 @@ Full write-up: [docs/phase-3-gateway.md](docs/phase-3-gateway.md)
     - [x] FP8 KV cache and speculative decoding under load
     - [x] SGLang comparison
 - [x] **Phase 3: Gateway.** API keys, per-key rate limiting (Redis), streaming proxy, overhead benchmark
-- [ ] **Phase 4: Containers.** Multi-stage Docker images, docker-compose stack
+- [x] **Phase 4: Containers.** Multi-stage gateway image, compose stack, Trivy scans, official vLLM image on a GPU
 - [ ] **Phase 5: Kubernetes.** Helm chart, GPU scheduling, probes, rolling updates
 - [ ] **Phase 6: Routing and autoscaling.** KV-cache-aware routing, KEDA autoscaling on queue depth
 - [ ] **Phase 7: Observability and CI.** Grafana dashboards, tracing, benchmark regression gate in CI
@@ -228,6 +247,7 @@ Full write-up: [docs/phase-3-gateway.md](docs/phase-3-gateway.md)
 
 ```
 TokenForge/
+├── compose.yaml            # gateway + Redis (+ fake engine with --profile fake)
 ├── baseline/
 │   └── server.py           # Phase 0: naive HF server (frozen; it's the "before")
 ├── bench/
@@ -235,9 +255,12 @@ TokenForge/
 │   ├── loadgen.py          # async load generator: TTFT, TPOT, goodput, $/1M tokens
 │   ├── plot.py             # latency vs throughput chart
 │   ├── phase2.sh           # Phase 2 engine experiments, run back to back on the GPU
+│   ├── phase4.sh           # Phase 4: laptop compose stack against a vLLM pod, then Trivy
 │   ├── workloads/          # committed once, never edited
 │   └── results/            # one JSON per run, with full metadata
 ├── gateway/
+│   ├── Dockerfile          # two stages, pinned, non-root; targets: gateway, fake
+│   ├── requirements.txt    # every image dependency at an exact version
 │   ├── app.py              # API keys, Redis rate limits, streaming passthrough
 │   ├── keys.py             # create / list / revoke API keys
 │   ├── fake_upstream.py    # fake engine with fixed timings (no GPU needed)
