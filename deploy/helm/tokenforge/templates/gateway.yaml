@@ -14,6 +14,7 @@ spec:
         # Env vars from a Secret are read only at pod start: roll the pods when the key changes.
         checksum/engine-secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
     spec:
+      terminationGracePeriodSeconds: {{ .Values.gateway.terminationGracePeriodSeconds }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -28,6 +29,11 @@ spec:
             - {name: REDIS_URL, value: "redis://{{ .Release.Name }}-redis:6379"}
             - name: UPSTREAM_API_KEY
               valueFrom: {secretKeyRef: {name: {{ .Release.Name }}-engine, key: apiKey}}
+          {{- if .Values.gateway.preStopSeconds }}
+          lifecycle:
+            # Keep serving while every node stops routing new requests here; only then SIGTERM.
+            preStop: {sleep: {seconds: {{ .Values.gateway.preStopSeconds }}}}
+          {{- end }}
           livenessProbe: {httpGet: {path: /health, port: http}, periodSeconds: 10}
           readinessProbe: {httpGet: {path: /health, port: http}, periodSeconds: 5}
           resources: {{- toYaml .Values.gateway.resources | nindent 12 }}

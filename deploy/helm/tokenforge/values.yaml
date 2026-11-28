@@ -4,6 +4,10 @@ gateway:
   image: tokenforge-gateway:dev   # built locally, then `kind load docker-image`
   replicas: 2                     # two processes share rate limits through Redis
   nodePort: 30080                 # deploy/kind.yaml maps it to localhost:8080
+  preStopSeconds: 5               # 0 disables; see docs/phase-5-kubernetes.md, piece 2
+  # A pod being replaced gets this long to finish its streams before it is killed.
+  # Longest stream: MAX_TOKENS_CAP 4096 x ~75 ms TPOT p95 at c=64 (Phase 2) ≈ 310 s.
+  terminationGracePeriodSeconds: 360
   resources:
     requests: {cpu: 250m, memory: 128Mi}
     limits: {memory: 256Mi}
