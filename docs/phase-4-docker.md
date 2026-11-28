@@ -181,15 +181,17 @@ for some steady-state requests (168–177/192 met, vs 190/192 inside the pod).
 In production the gateway and the GPU sit in the same datacenter. This setup
 measures a home connection.
 
-**3. The gateway's cost can't be measured here.** Through the gateway, TTFT
-was *lower* than direct (154 vs 236 ms p50 at c=1; the fastest request was
-85 vs 124 ms). A gateway can't make requests faster, so this difference comes
-from the network, not the gateway: the two runs ran one after the other,
-5 minutes apart, over a home internet path whose delay varies by tens of
-milliseconds. Phase 3's 2.5 ms gateway cost is far below that variation.
-Telling them apart would need interleaved runs (direct, gateway, direct,
-gateway…). I didn't do that; the result is "no visible cost," not a
-measured number.
+**3. The gateway's cost can't be measured here, and my first explanation of
+why was wrong.** Through the gateway, TTFT was *lower* than direct (154 vs
+236 ms p50 at c=1, 500 vs 679 ms at c=64). A gateway can't make requests
+faster. I first put this down to the network changing between two runs made
+5 minutes apart. **Correction (Phase 5, piece 3):** with direct and cluster
+runs alternated twice, the indirect path was again 100–150 ms faster at
+c ≥ 8 in both rounds, so the effect is systematic, not drift. At c=1 it's
+within the ±20–30 ms run-to-run noise. My unverified hypothesis is the client
+side: going direct, loadgen on macOS receives every stream over the internet
+itself; via the gateway, a Linux process does. Either way, the gateway's
+~2.5 ms (Phase 3) can't be seen through this path.
 
 **4. Docker Desktop's slowdown didn't appear on real hardware.** The laptop
 smoke run had suggested +52 ms TTFT at c=64 through the containerized

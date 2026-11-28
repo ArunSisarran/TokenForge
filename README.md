@@ -212,7 +212,7 @@ a volume. I ran the compose stack on my laptop against vLLM on a RunPod L4.
 
 **3. The vLLM image has 12x the findings (2,650, 18 critical), but 51% of them and every critical are kernel headers (`linux-libc-dev`)** that a container never runs. The image's size (CUDA, ffmpeg, ~300 Python packages) drives the count.
 
-**4. Going over the internet raised TTFT, not TPOT:** c=1 TTFT p50 rose from 80 ms to 154–236 ms, while TPOT stayed at 20.8 ms. The gateway's ~2.5 ms (Phase 3) disappears into that jitter: the gateway run was even faster than the direct run, which can only be the network varying between runs.
+**4. Going over the internet raised TTFT, not TPOT:** c=1 TTFT p50 rose from 80 ms to 154–236 ms, while TPOT stayed at 20.8 ms. The gateway's ~2.5 ms (Phase 3) can't be seen over this path: from c=8 up, requests through the gateway were consistently 100–150 ms *faster* to the first token than direct, an effect I first misread as network drift (corrected in Phase 5, cause still unverified).
 
 Full write-up: [docs/phase-4-docker.md](docs/phase-4-docker.md)
 
