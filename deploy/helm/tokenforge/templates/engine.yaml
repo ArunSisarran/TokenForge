@@ -1,0 +1,60 @@
+{{- $e := .Values.engine }}
+{{- if not (has $e.mode (list "simulator" "external")) }}
+{{- fail "engine.mode must be simulator or external" }}
+{{- end }}
+{{- if eq $e.mode "simulator" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-engine
+  labels: {app.kubernetes.io/name: engine, app.kubernetes.io/instance: {{ .Release.Name }}}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: engine, app.kubernetes.io/instance: {{ .Release.Name }}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: engine, app.kubernetes.io/instance: {{ .Release.Name }}}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: engine
+          image: {{ $e.simulator.image }}
+          args: {{- toYaml $e.simulator.args | nindent 12 }}
+          ports: [{name: http, containerPort: 8000}]
+          # The startup probe allows a slow model load (up to 5 min) before the liveness
+          # probe starts counting; without it, liveness would kill the pod mid-load.
+          startupProbe: {httpGet: {path: /health/ready, port: http}, periodSeconds: 5, failureThreshold: 60}
+          readinessProbe: {httpGet: {path: /health/ready, port: http}, periodSeconds: 5}
+          livenessProbe: {httpGet: {path: /health, port: http}, periodSeconds: 10}
+          resources: {{- toYaml $e.simulator.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+---
+{{- else }}
+# No selector: Kubernetes doesn't manage these endpoints; the EndpointSlice below
+# points the Service at vLLM outside the cluster.
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: {{ .Release.Name }}-engine-external
+  labels: {kubernetes.io/service-name: {{ .Release.Name }}-engine}
+addressType: IPv4
+ports: [{name: http, port: {{ $e.external.port }}, protocol: TCP}]
+endpoints: [{addresses: [{{ required "engine.external.ip is required" $e.external.ip | quote }}]}]
+---
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-engine
+  labels: {app.kubernetes.io/name: engine, app.kubernetes.io/instance: {{ .Release.Name }}}
+spec:
+  {{- if eq $e.mode "simulator" }}
+  selector: {app.kubernetes.io/name: engine, app.kubernetes.io/instance: {{ .Release.Name }}}
+  {{- end }}
+  ports: [{name: http, port: 8000, targetPort: {{ if eq $e.mode "simulator" }}http{{ else }}{{ $e.external.port }}{{ end }}}]

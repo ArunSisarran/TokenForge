@@ -1,0 +1,12 @@
+# kind cluster for TokenForge: one control plane and two workers, so pods can be
+# scheduled across nodes. The gateway's NodePort 30080 is reachable at localhost:8080.
+#
+#     kind create cluster --name tokenforge --config deploy/kind.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - {containerPort: 30080, hostPort: 8080, listenAddress: "127.0.0.1"}
+  - role: worker
+  - role: worker
