@@ -2,6 +2,7 @@
 {{- if not (has $e.mode (list "simulator" "external")) }}
 {{- fail "engine.mode must be simulator or external" }}
 {{- end }}
+{{- $svc := include "tokenforge.engineService" . }}
 {{- if eq $e.mode "simulator" }}
 apiVersion: apps/v1
 kind: Deployment
@@ -36,13 +37,14 @@ spec:
             capabilities: {drop: [ALL]}
 ---
 {{- else }}
-# No selector: Kubernetes doesn't manage these endpoints; the EndpointSlice below
-# points the Service at vLLM outside the cluster.
+# A separate Service with no selector, not the simulator's Service with its selector
+# removed: Kubernetes would keep that Service's old endpoint slices, still pointing at
+# the deleted simulator pod. This EndpointSlice points the Service at vLLM outside.
 apiVersion: discovery.k8s.io/v1
 kind: EndpointSlice
 metadata:
-  name: {{ .Release.Name }}-engine-external
-  labels: {kubernetes.io/service-name: {{ .Release.Name }}-engine}
+  name: {{ $svc }}
+  labels: {kubernetes.io/service-name: {{ $svc }}}
 addressType: IPv4
 ports: [{name: http, port: {{ $e.external.port }}, protocol: TCP}]
 endpoints: [{addresses: [{{ required "engine.external.ip is required" $e.external.ip | quote }}]}]
@@ -51,7 +53,7 @@ endpoints: [{addresses: [{{ required "engine.external.ip is required" $e.externa
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ .Release.Name }}-engine
+  name: {{ $svc }}
   labels: {app.kubernetes.io/name: engine, app.kubernetes.io/instance: {{ .Release.Name }}}
 spec:
   {{- if eq $e.mode "simulator" }}

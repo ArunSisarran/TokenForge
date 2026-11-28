@@ -25,7 +25,7 @@ spec:
           imagePullPolicy: IfNotPresent
           ports: [{name: http, containerPort: 8080}]
           env:
-            - {name: UPSTREAM_URL, value: "http://{{ .Release.Name }}-engine:8000"}
+            - {name: UPSTREAM_URL, value: "http://{{ include "tokenforge.engineService" . }}:8000"}
             - {name: REDIS_URL, value: "redis://{{ .Release.Name }}-redis:6379"}
             - name: UPSTREAM_API_KEY
               valueFrom: {secretKeyRef: {name: {{ .Release.Name }}-engine, key: apiKey}}
